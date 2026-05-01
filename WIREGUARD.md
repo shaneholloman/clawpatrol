@@ -55,10 +55,8 @@ in promiscuous mode — same shape as unclaw's `boringtun` + `smoltcp`
   dispatch fires `g.handle`, SNI matches, MITM injects real OAuth,
   forwards to real upstream, response returns through the tunnel.
 
-## What's still rough
+## vs Tailscale mode
 
-- `clawall gateway init` exists but is minimal. `scripts/deploy.sh`
-  is the heavier path.
 - Dashboard auth in WG mode falls back to `admin_email` for every
   approval. Multi-user setups need an auth proxy
   (Cloudflare Access, basic auth, etc.) that fills
