@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import {
   aiEditRules,
-  getDeviceRulesYAML,
-  getRulesYAML,
-  putDeviceRulesYAML,
-  putRulesYAML,
+  getDeviceRulesHCL,
+  getRulesJSON,
+  putDeviceRulesHCL,
+  putRulesJSON,
 } from "../lib/api";
+import { HCLEditor } from "./HCLEditor";
 
 export function RulesEditor({
   deviceIP,
@@ -16,7 +17,7 @@ export function RulesEditor({
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [yaml, setYaml] = useState("");
+  const [text, setText] = useState("");
   const [original, setOriginal] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -25,11 +26,11 @@ export function RulesEditor({
   const [aiBusy, setAIBusy] = useState(false);
 
   useEffect(() => {
-    const fetcher = deviceIP ? getDeviceRulesYAML(deviceIP) : getRulesYAML();
+    const fetcher = deviceIP ? getDeviceRulesHCL(deviceIP) : getRulesJSON();
     fetcher
-      .then((y) => {
-        setYaml(y);
-        setOriginal(y);
+      .then((t) => {
+        setText(t);
+        setOriginal(t);
       })
       .catch((e: Error) => setErr(String(e.message ?? e)));
   }, [deviceIP]);
@@ -40,10 +41,10 @@ export function RulesEditor({
     setOkMsg(null);
     try {
       const r = deviceIP
-        ? await putDeviceRulesYAML(deviceIP, yaml)
-        : await putRulesYAML(yaml);
+        ? await putDeviceRulesHCL(deviceIP, text)
+        : await putRulesJSON(text);
       setOkMsg(`saved · ${r.count} rule${r.count === 1 ? "" : "s"} active`);
-      setOriginal(yaml);
+      setOriginal(text);
       onSaved();
     } catch (e: any) {
       setErr(String(e.message ?? e));
@@ -58,8 +59,8 @@ export function RulesEditor({
     setAIBusy(true);
     setErr(null);
     try {
-      const r = await aiEditRules(aiPrompt, yaml, deviceIP ? "device" : "global");
-      setYaml(r.yaml);
+      const r = await aiEditRules(aiPrompt, text, deviceIP ? "device" : "global");
+      setText(r.yaml);
       setAIPrompt("");
     } catch (e: any) {
       setErr(String(e.message ?? e));
@@ -68,7 +69,7 @@ export function RulesEditor({
     }
   }
 
-  const dirty = yaml !== original;
+  const dirty = text !== original;
   const scopeLabel = deviceIP ? `device ${deviceIP}` : "global";
 
   return (
@@ -90,13 +91,9 @@ export function RulesEditor({
           </button>
         </div>
 
-        <textarea
-          value={yaml}
-          onChange={(e) => setYaml(e.target.value)}
-          spellCheck={false}
-          className="flex-1 w-full p-4 text-[12px] font-mono text-[#171717] bg-[#fafafa] focus:outline-none resize-none border-0"
-          style={{ minHeight: 320 }}
-        />
+        <div className="flex-1 overflow-auto">
+          <HCLEditor value={text} onChange={setText} minHeight={320} />
+        </div>
 
         <form onSubmit={runAI} className="flex items-center gap-2 px-4 py-2.5 border-t border-[#e5e5e5] bg-white">
           <span className="text-[10px] uppercase tracking-[.09em] text-[#a3a3a3]">AI</span>

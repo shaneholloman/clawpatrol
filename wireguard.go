@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -131,6 +132,20 @@ func (t *netTun) Write(bufs [][]byte, offset int) (int, error) {
 		if len(pkt) == 0 {
 			continue
 		}
+		// diag: log TCP SYNs to non-443/8080 ports so we can see if
+		// packets reach the netstack but the forwarder doesn't fire.
+		if len(pkt) >= 40 && (pkt[0]>>4) == 4 && pkt[9] == 6 {
+			ihl := int(pkt[0]&0xf) * 4
+			if len(pkt) >= ihl+14 {
+				flags := pkt[ihl+13]
+				dstPort := (uint16(pkt[ihl+2]) << 8) | uint16(pkt[ihl+3])
+				if flags&0x02 != 0 && dstPort != 443 && dstPort != 80 && dstPort != 8080 {
+					srcIP := net.IP(pkt[12:16]).String()
+					dstIP := net.IP(pkt[16:20]).String()
+					log.Printf("wg-syn: %s → %s:%d", srcIP, dstIP, dstPort)
+				}
+			}
+		}
 		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buffer.MakeWithData(pkt),
 		})
@@ -224,18 +239,27 @@ func StartWGServer(ts Tailscale, stateDir string) (*WGServer, error) {
 }
 
 // AddPeer registers a peer (after admin approval). Idempotent — same
-// pubkey overwrites previous AllowedIPs. Persists the (pubkey → ip)
-// mapping to disk so the gateway can replay registrations on restart;
-// wireguard-go peers are in-memory only.
+// pubkey overwrites previous AllowedIPs. Any prior peer registered to
+// the same WG-side IP is REVOKED (in-memory + on disk) so the
+// allowed-IPs trie never has multiple owners for one /32. Without
+// this, accumulated ghost peers from previous onboards win the trie
+// race on restart and silently drop the current client's traffic.
 func (s *WGServer) AddPeer(pubkeyHex, peerIP string) error {
-	cfg := fmt.Sprintf(
+	peers := loadPeers(s.peerFile)
+	for oldKey, oldIP := range peers {
+		if oldIP == peerIP && oldKey != pubkeyHex {
+			// remove the stale peer from wg-go's trie so it can't claim
+			// our IP on the next handshake.
+			_ = s.dev.IpcSet(fmt.Sprintf("public_key=%s\nremove=true\n", oldKey))
+			delete(peers, oldKey)
+		}
+	}
+	if err := s.dev.IpcSet(fmt.Sprintf(
 		"public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s/32\n",
 		pubkeyHex, peerIP,
-	)
-	if err := s.dev.IpcSet(cfg); err != nil {
+	)); err != nil {
 		return err
 	}
-	peers := loadPeers(s.peerFile)
 	peers[pubkeyHex] = peerIP
 	return savePeers(s.peerFile, peers)
 }

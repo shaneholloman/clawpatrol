@@ -49,14 +49,14 @@ func ruleForPort(rules []Rule, port int) *Rule {
 
 func (g *Gateway) servePorts() {
 	host := splitHost(g.cfg.Listen)
-	for _, port := range uniqueExtraPorts(g.rules) {
+	for _, port := range uniqueExtraPorts(g.Rules()) {
 		addr := net.JoinHostPort(host, strconv.Itoa(port))
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			log.Printf("listen %s: %v", addr, err)
 			continue
 		}
-		log.Printf("port %d listening (%d-host rule)", port, countRulesOnPort(g.rules, port))
+		log.Printf("port %d listening (%d-host rule)", port, countRulesOnPort(g.Rules(), port))
 		go g.acceptRaw(ln, port)
 	}
 }
@@ -74,7 +74,7 @@ func (g *Gateway) acceptRaw(ln net.Listener, port int) {
 
 func (g *Gateway) handleRaw(c net.Conn, port int) {
 	defer c.Close()
-	rule := ruleForPort(g.rules, port)
+	rule := ruleForPort(g.Rules(), port)
 	if rule == nil {
 		return
 	}

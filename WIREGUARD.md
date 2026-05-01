@@ -31,7 +31,7 @@ in promiscuous mode — same shape as unclaw's `boringtun` + `smoltcp`
 
 ## What works (verified end-to-end on vultr)
 
-- `clawpatrol gateway -config gateway.yaml` boots WG endpoint on
+- `clawpatrol gateway -config gateway.hcl` boots WG endpoint on
   UDP 51820, dashboard + MITM ride the same forwarder.
 - Server keypair persisted at `<oauth_dir>/wg-server.key`. Pubkey
   derived via curve25519 at boot. Peer (pubkey → IP) map persisted
@@ -72,20 +72,21 @@ in promiscuous mode — same shape as unclaw's `boringtun` + `smoltcp`
 # on the gateway VM (real public IP needed)
 curl -fsSL https://denoland.github.io/clawpatrol-go/install.sh | sh
 
-cat > /etc/clawpatrol/gateway.yaml <<EOF
-listen: "0.0.0.0:8443"
-info_listen: "0.0.0.0:8080"
-public_url: "http://your-gw.example.com:8080"
-ca_dir: "/opt/clawpatrol/ca"
-log_path: "/opt/clawpatrol/gateway.log"
-oauth_dir: "/opt/clawpatrol/oauth"
-admin_email: "you@example.com"
-integrations: [claude, codex, github]
-tailscale:
-  control: wireguard
-  wg_endpoint: "your-gw.example.com:51820"
-  wg_subnet_cidr: "10.55.0.0/24"
-rules: []
+cat > /etc/clawpatrol/gateway.hcl <<'EOF'
+listen       = "0.0.0.0:8443"
+info_listen  = "0.0.0.0:8080"
+public_url   = "http://your-gw.example.com:8080"
+admin_email  = "you@example.com"
+ca_dir       = "/opt/clawpatrol/ca"
+log_path     = "/opt/clawpatrol/gateway.log"
+oauth_dir    = "/opt/clawpatrol/oauth"
+integrations = ["claude", "codex", "github"]
+
+tailscale {
+  control        = "wireguard"
+  wg_endpoint    = "your-gw.example.com:51820"
+  wg_subnet_cidr = "10.55.0.0/24"
+}
 EOF
 
 mkdir -p /opt/clawpatrol
@@ -93,7 +94,7 @@ clawpatrol init-ca /opt/clawpatrol/ca
 
 iptables -I INPUT -p udp --dport 51820 -j ACCEPT
 iptables -I INPUT -p tcp --dport 8080 -j ACCEPT
-clawpatrol gateway -config /etc/clawpatrol/gateway.yaml
+clawpatrol gateway -config /etc/clawpatrol/gateway.hcl
 ```
 
 Connect Claude / GitHub / Codex via the dashboard at

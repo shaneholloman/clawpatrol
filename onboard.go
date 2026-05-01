@@ -50,33 +50,57 @@ type onboardSession struct {
 	loginServer string // "wireguard://<iface>" for WG mode; empty for Tailscale
 	err         string
 	owner       string // who approved (for audit log)
+	hostname    string // client-supplied (os.Hostname) at /api/onboard/start
+}
+
+// onboardStore is the on-disk persistence shape. Per-IP owner +
+// hostname + profile assignment, keyed by peer IP. Persisted at
+// <oauth_dir>/onboarded.json.
+type onboardStore struct {
+	OwnerByIP    map[string]string `json:"owner_by_ip"`
+	HostnameByIP map[string]string `json:"hostname_by_ip,omitempty"`
+	ProfileByIP  map[string]string `json:"profile_by_ip,omitempty"`
 }
 
 type onboardRegistry struct {
-	mu       sync.Mutex
-	byDevice map[string]*onboardSession
-	byUser   map[string]*onboardSession
-	// ownerByIP maps a tailnet IP to the human approver email. Tailscale
-	// OAuth client_credentials always mints `tag:client` keys, so whois
-	// for onboarded devices returns "tagged-devices" — useless for
-	// per-user OAuth integration scoping. After `clawpatrol join` finishes,
-	// the CLI hits /api/onboard/claim from the new tailnet IP; we record
-	// (peer-ip → approver) here and use it as a whois override. Persisted
-	// to disk so gateway restarts don't drop the mapping.
-	ownerByIP map[string]string
-	storePath string
+	mu           sync.Mutex
+	byDevice     map[string]*onboardSession
+	byUser       map[string]*onboardSession
+	ownerByIP    map[string]string
+	hostnameByIP map[string]string
+	profileByIP  map[string]string
+	storePath    string
 }
 
 func newOnboardRegistry() *onboardRegistry {
 	return &onboardRegistry{
-		byDevice:  map[string]*onboardSession{},
-		byUser:    map[string]*onboardSession{},
-		ownerByIP: map[string]string{},
+		byDevice:     map[string]*onboardSession{},
+		byUser:       map[string]*onboardSession{},
+		ownerByIP:    map[string]string{},
+		hostnameByIP: map[string]string{},
+		profileByIP:  map[string]string{},
 	}
 }
 
+func (r *onboardRegistry) ProfileForIP(ip string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.profileByIP[ip]
+}
+
+// AssignProfile records that a peer IP belongs to a named profile.
+// Persists to disk.
+func (r *onboardRegistry) AssignProfile(ip, profile string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.profileByIP[ip] = profile
+	r.saveLocked()
+}
+
 // Load attaches a disk file for owner-by-ip persistence and replays
-// any existing entries. Call once after construction.
+// any existing entries. Call once after construction. Reads both the
+// new {owner_by_ip, hostname_by_ip} schema and the legacy flat
+// ip→owner map for backward compatibility.
 func (r *onboardRegistry) Load(dir string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -85,6 +109,19 @@ func (r *onboardRegistry) Load(dir string) {
 	if err != nil {
 		return
 	}
+	// Try new schema first.
+	var s onboardStore
+	if err := json.Unmarshal(b, &s); err == nil && s.OwnerByIP != nil {
+		r.ownerByIP = s.OwnerByIP
+		if s.HostnameByIP != nil {
+			r.hostnameByIP = s.HostnameByIP
+		}
+		if s.ProfileByIP != nil {
+			r.profileByIP = s.ProfileByIP
+		}
+		return
+	}
+	// Fall back to legacy flat map.
 	_ = json.Unmarshal(b, &r.ownerByIP)
 }
 
@@ -92,7 +129,7 @@ func (r *onboardRegistry) saveLocked() {
 	if r.storePath == "" {
 		return
 	}
-	b, _ := json.MarshalIndent(r.ownerByIP, "", "  ")
+	b, _ := json.MarshalIndent(onboardStore{OwnerByIP: r.ownerByIP, HostnameByIP: r.hostnameByIP, ProfileByIP: r.profileByIP}, "", "  ")
 	_ = os.WriteFile(r.storePath, b, 0o600)
 }
 
@@ -104,6 +141,9 @@ func (r *onboardRegistry) ClaimIP(deviceCode, ip string) (string, bool) {
 		return "", false
 	}
 	r.ownerByIP[ip] = s.owner
+	if s.hostname != "" {
+		r.hostnameByIP[ip] = s.hostname
+	}
 	r.saveLocked()
 	return s.owner, true
 }
@@ -114,10 +154,18 @@ func (r *onboardRegistry) OwnerForIP(ip string) string {
 	return r.ownerByIP[ip]
 }
 
+func (r *onboardRegistry) HostnameForIP(ip string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.hostnameByIP[ip]
+}
+
 func (r *onboardRegistry) ForgetIP(ip string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.ownerByIP, ip)
+	delete(r.hostnameByIP, ip)
+	delete(r.profileByIP, ip)
 	r.saveLocked()
 }
 

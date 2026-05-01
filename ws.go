@@ -58,7 +58,6 @@ func parseWSExtensions(headerVal string) wsParams {
 
 type wsRewrite struct {
 	swaps     []Swap
-	track     string         // "codex_ws_usage" etc, empty = none
 	onPayload func(text []byte)
 }
 
@@ -69,6 +68,7 @@ func isWSUpgrade(req *http.Request) bool {
 }
 
 func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.Request, rule *Rule, upstream string) {
+	agentAddr := peerIP(client) // capture before the conn races to closed
 	// Cloudflare flags non-browser TLS fingerprints on WS handshakes to
 	// chatgpt.com with "Attack attempt detected". Use uTLS Chrome
 	// fingerprint for the upstream WS dial regardless of host (cheap,
@@ -133,10 +133,10 @@ func (g *Gateway) handleWSUpgrade(client *tls.Conn, br *bufio.Reader, req *http.
 		return
 	}
 	params := parseWSExtensions(respHeaders.Get("Sec-WebSocket-Extensions"))
-	rw := &wsRewrite{swaps: rule.Swap, track: rule.Track}
-	if rule.Track == "codex_ws_usage" {
+	rw := &wsRewrite{swaps: rule.Swap}
+	if trackKindFor(upstream) == "codex_ws_usage" {
 		rw.onPayload = func(text []byte) {
-			g.trackCodexWSUsage(client.RemoteAddr().String(), text)
+			g.trackCodexWSUsage(agentAddr, text)
 		}
 	}
 	clientBR := br

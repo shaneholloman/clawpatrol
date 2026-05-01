@@ -16,14 +16,14 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/hcl/v2/hclsimple"
+	"github.com/hashicorp/hcl/v2/hclwrite"
 	"golang.org/x/oauth2"
-	"gopkg.in/yaml.v3"
 )
 
 //go:embed all:www/dist
@@ -70,9 +70,12 @@ func newWebMux(g *Gateway, caDir string, ts Tailscale, publicURL string) http.Ha
 	mux.HandleFunc("/api/status", w.apiStatus)
 	mux.HandleFunc("/api/agents", w.apiAgents)
 	mux.HandleFunc("/api/agents/delete", w.apiAgentDelete)
+	mux.HandleFunc("/api/agents/profile", w.apiAgentProfile)
+	mux.HandleFunc("/api/profiles", w.apiProfiles)
 	mux.HandleFunc("/api/rules", w.apiRules)
 	mux.HandleFunc("/api/rules/device", w.apiDeviceRules)
 	mux.HandleFunc("/api/rules/ai", w.apiRulesAI)
+	mux.HandleFunc("/api/config", w.apiConfig)
 	mux.HandleFunc("/api/hitl/pending", w.apiHITLPending)
 	mux.HandleFunc("/api/hitl/decide", w.apiHITLDecide)
 	mux.HandleFunc("/api/oauth/start", w.apiOAuthStart)
@@ -188,9 +191,18 @@ func (w *webMux) callerIdentity(r *http.Request) (user, device, displayHost stri
 }
 
 // ownerForCaller returns the user-scoped credential-owner key for a
-// dashboard request. Falls back to host when whois unavailable.
+// dashboard request. In WG mode (no tailnet identity), every dashboard
+// caller resolves to the operator-configured admin_email so OAuth
+// tokens land under the same key the gateway uses to look them up at
+// MITM time (see Gateway.ownerForRequest, which also falls back to
+// admin_email for peer IPs that aren't whois-resolvable).
 func (w *webMux) ownerForCaller(r *http.Request) (key, label string) {
 	user, _, host := w.callerIdentity(r)
+	wgMode := !strings.EqualFold(w.g.cfg.Tailscale.Control, "tailscale") &&
+		w.g.cfg.Tailscale.Control != ""
+	if wgMode && w.g.cfg.AdminEmail != "" {
+		return w.g.cfg.AdminEmail, w.g.cfg.AdminEmail
+	}
 	if user != "" {
 		return user, user
 	}
@@ -289,20 +301,49 @@ func (w *webMux) apiAgentDelete(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(rw, map[string]bool{"ok": true})
 }
 
+// apiAgentProfile assigns a peer IP to a named profile. Profile must
+// be declared in cfg.Profiles. The mapping is persisted in
+// onboard.profileByIP and consulted by Gateway.profileFor at MITM
+// time, so rule scoping switches over immediately.
+func (w *webMux) apiAgentProfile(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(rw, "POST", 405)
+		return
+	}
+	ip := r.URL.Query().Get("ip")
+	profile := r.URL.Query().Get("profile")
+	if ip == "" || profile == "" {
+		http.Error(rw, "missing ip or profile", 400)
+		return
+	}
+	known := false
+	for _, p := range w.g.cfg.Profiles {
+		if p.Name == profile {
+			known = true
+			break
+		}
+	}
+	if !known {
+		http.Error(rw, "unknown profile", 400)
+		return
+	}
+	w.g.onboard.AssignProfile(ip, profile)
+	writeJSON(rw, map[string]any{"ok": true, "ip": ip, "profile": profile})
+}
+
+// apiProfiles lists declared profile names so the dashboard can
+// render a profile picker per device.
+func (w *webMux) apiProfiles(rw http.ResponseWriter, _ *http.Request) {
+	out := make([]string, 0, len(w.g.cfg.Profiles))
+	for _, p := range w.g.cfg.Profiles {
+		out = append(out, p.Name)
+	}
+	writeJSON(rw, out)
+}
+
 func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
-		// return YAML if requested, else JSON
-		if r.URL.Query().Get("format") == "yaml" {
-			rw.Header().Set("Content-Type", "application/x-yaml")
-			b, err := yaml.Marshal(w.g.cfg.Rules)
-			if err != nil {
-				http.Error(rw, err.Error(), 500)
-				return
-			}
-			rw.Write(b)
-			return
-		}
 		writeJSON(rw, w.g.cfg.Rules)
 	case "PUT":
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
@@ -311,15 +352,14 @@ func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var rules []Rule
-		if err := yaml.Unmarshal(body, &rules); err != nil {
-			http.Error(rw, "yaml: "+err.Error(), 400)
+		if err := json.Unmarshal(body, &rules); err != nil {
+			http.Error(rw, "json: "+err.Error(), 400)
 			return
 		}
-		// validate by re-running expandIntegrations? skip; rules already expanded.
 		w.g.cfg.Rules = rules
-		w.g.rules = rules
-		// persist sidecar
-		if err := os.WriteFile(rulesOverrideFile(w.g.cfg), body, 0o644); err != nil {
+		rulesCopy := append([]Rule(nil), rules...)
+		w.g.rules.Store(&rulesCopy)
+		if err := writeConfigHCL(w.g.cfg, w.g.cfgPath); err != nil {
 			http.Error(rw, "persist: "+err.Error(), 500)
 			return
 		}
@@ -338,6 +378,7 @@ func (w *webMux) apiDeviceRules(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "missing ip", 400)
 		return
 	}
+	hcl := r.URL.Query().Get("format") == "hcl"
 	switch r.Method {
 	case "GET":
 		deviceRules := []Rule{}
@@ -346,14 +387,9 @@ func (w *webMux) apiDeviceRules(rw http.ResponseWriter, r *http.Request) {
 				deviceRules = append(deviceRules, x)
 			}
 		}
-		if r.URL.Query().Get("format") == "yaml" {
-			rw.Header().Set("Content-Type", "application/x-yaml")
-			b, err := yaml.Marshal(deviceRules)
-			if err != nil {
-				http.Error(rw, err.Error(), 500)
-				return
-			}
-			rw.Write(b)
+		if hcl {
+			rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			rw.Write(emitDeviceRulesHCL(w.g, ip, deviceRules))
 			return
 		}
 		writeJSON(rw, deviceRules)
@@ -364,9 +400,20 @@ func (w *webMux) apiDeviceRules(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var newRules []Rule
-		if err := yaml.Unmarshal(body, &newRules); err != nil {
-			http.Error(rw, "yaml: "+err.Error(), 400)
-			return
+		if hcl {
+			var holder struct {
+				Rules []Rule `hcl:"rule,block"`
+			}
+			if err := hclsimple.Decode("device.hcl", body, nil, &holder); err != nil {
+				http.Error(rw, "hcl: "+err.Error(), 400)
+				return
+			}
+			newRules = holder.Rules
+		} else {
+			if err := json.Unmarshal(body, &newRules); err != nil {
+				http.Error(rw, "json: "+err.Error(), 400)
+				return
+			}
 		}
 		// Force Device=ip on every submitted rule (server-side trust:
 		// don't let a device's editor accidentally edit other devices'
@@ -374,7 +421,6 @@ func (w *webMux) apiDeviceRules(rw http.ResponseWriter, r *http.Request) {
 		for i := range newRules {
 			newRules[i].Device = ip
 		}
-		// Replace just the slice of rules belonging to this device.
 		var merged []Rule
 		for _, x := range w.g.cfg.Rules {
 			if x.Device != ip {
@@ -383,10 +429,9 @@ func (w *webMux) apiDeviceRules(rw http.ResponseWriter, r *http.Request) {
 		}
 		merged = append(merged, newRules...)
 		w.g.cfg.Rules = merged
-		w.g.rules = merged
-		// persist all rules (sidecar)
-		full, _ := yaml.Marshal(merged)
-		if err := os.WriteFile(rulesOverrideFile(w.g.cfg), full, 0o644); err != nil {
+		mergedCopy := append([]Rule(nil), merged...)
+		w.g.rules.Store(&mergedCopy)
+		if err := writeConfigHCL(w.g.cfg, w.g.cfgPath); err != nil {
 			http.Error(rw, "persist: "+err.Error(), 500)
 			return
 		}
@@ -396,10 +441,77 @@ func (w *webMux) apiDeviceRules(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// apiRulesAI translates a natural-language request into a rule YAML
+// emitDeviceRulesHCL renders a per-device editing fragment: a
+// commented summary of which profile the device sits in (read-only
+// context for the operator) plus the editable `rule {}` blocks scoped
+// to this device. Operators edit only the device-scoped rules; profile
+// + global config lives in /api/config.
+func emitDeviceRulesHCL(g *Gateway, ip string, deviceRules []Rule) []byte {
+	profile := g.profileFor(ip)
+	var b []byte
+	b = append(b, []byte("# device: "+ip+"\n# profile: "+profile+"\n")...)
+	b = append(b, []byte("# (this editor manages device-scoped rule overrides only —\n#  profile + global rules live in the gateway settings editor.)\n\n")...)
+	if len(deviceRules) == 0 {
+		b = append(b, []byte("# no device-scoped rules yet. Add `rule { ... }` blocks below.\n")...)
+		return b
+	}
+	f := hclwrite.NewEmptyFile()
+	for _, r := range deviceRules {
+		f.Body().AppendNewline()
+		writeRuleHCL(f.Body(), r)
+	}
+	b = append(b, f.Bytes()...)
+	return b
+}
+
+// apiConfig serves the entire gateway.hcl for the global settings
+// editor. GET returns the file as-is (preserves operator comments).
+// PUT validates by re-parsing + writing through writeConfigHCL so
+// hot-reload picks up the change.
+func (w *webMux) apiConfig(rw http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		b, err := os.ReadFile(w.g.cfgPath)
+		if err != nil {
+			http.Error(rw, err.Error(), 500)
+			return
+		}
+		rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		rw.Write(b)
+	case "PUT":
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			http.Error(rw, err.Error(), 400)
+			return
+		}
+		// validate by parsing into a fresh Config
+		var probe Config
+		if err := hclsimple.Decode("gateway.hcl", body, nil, &probe); err != nil {
+			http.Error(rw, "hcl: "+err.Error(), 400)
+			return
+		}
+		// atomic write — mtime watcher reloads + applies.
+		tmp := w.g.cfgPath + ".tmp"
+		if err := os.WriteFile(tmp, body, 0o600); err != nil {
+			http.Error(rw, "write: "+err.Error(), 500)
+			return
+		}
+		if err := os.Rename(tmp, w.g.cfgPath); err != nil {
+			http.Error(rw, "rename: "+err.Error(), 500)
+			return
+		}
+		writeJSON(rw, map[string]any{"ok": true, "bytes": len(body)})
+	default:
+		http.Error(rw, "GET or PUT", 405)
+	}
+}
+
+// apiRulesAI translates a natural-language request into an HCL rule
 // edit using a connected LLM provider. POST body:
 //   {prompt, current_yaml, scope: "device"|"global", agent: "claude"|"codex"}
-// Returns: {yaml: <suggested>}.
+// Returns: {yaml: <suggested>}. (Wire field names stay as
+// `current_yaml`/`yaml` for backward compat with existing dashboard
+// builds — the contents are HCL.)
 func (w *webMux) apiRulesAI(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(rw, "POST", 405)
@@ -424,7 +536,7 @@ func (w *webMux) apiRulesAI(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "tailnet identity required", 403)
 		return
 	}
-	out, err := generateRuleYAML(r.Context(), w.g.oauth, body.Agent, owner, body.Prompt, body.CurrentYAML, body.Scope)
+	out, err := generateRuleHCL(r.Context(), w.g.oauth, body.Agent, owner, body.Prompt, body.CurrentYAML, body.Scope)
 	if err != nil {
 		http.Error(rw, "ai: "+err.Error(), 502)
 		return
@@ -456,14 +568,6 @@ func (w *webMux) apiHITLDecide(rw http.ResponseWriter, r *http.Request) {
 
 func isLoopback(host string) bool {
 	return host == "127.0.0.1" || host == "::1" || strings.HasPrefix(host, "127.")
-}
-
-func rulesOverrideFile(cfg *Config) string {
-	dir := cfg.OAuthDir
-	if dir == "" {
-		dir = filepath.Join(cfg.CADir, "..", "oauth")
-	}
-	return filepath.Join(dir, "rules.yaml")
 }
 
 func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
@@ -790,10 +894,23 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	ch, cancel := w.g.sink.Subscribe()
+	backlog, ch, cancel := w.g.sink.RecentAndSubscribe()
 	defer cancel()
 
 	fmt.Fprint(rw, ": connected\n\n")
+	// Replay backlog (oldest → newest) so a refreshed dashboard sees the
+	// last few hundred events instead of an empty stream. Frontend
+	// prepends each event, so newest still ends up at the top.
+	for _, ev := range backlog {
+		if wantIP != "" && ev.AgentIP != wantIP {
+			continue
+		}
+		b, err := json.Marshal(ev)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(rw, "data: %s\n\n", b)
+	}
 	flusher.Flush()
 
 	keepalive := time.NewTicker(15 * time.Second)
@@ -838,6 +955,14 @@ func (w *webMux) apiOnboardStart(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := w.onboard.start()
+	// CLI passes its os.Hostname() so the dashboard shows a real
+	// device name instead of just the WG-side IP. Optional — we still
+	// fall back gracefully when missing.
+	if hn := strings.TrimSpace(r.URL.Query().Get("hostname")); hn != "" {
+		w.onboard.mu.Lock()
+		s.hostname = hn
+		w.onboard.mu.Unlock()
+	}
 	// Prefer the operator-configured public_url so brand-new clients
 	// see a real URL. Fall back to the request's Host header for
 	// dev / direct-IP setups. Tailscale Funnel hostnames (*.ts.net)
@@ -885,18 +1010,8 @@ func (w *webMux) apiOnboardApprove(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	owner, _ := w.ownerForCaller(r)
-	// In wireguard / proxy mode there's no tailnet identity. ownerForCaller
-	// falls back to peer IP — useless for OAuth scoping. Substitute the
-	// operator-configured admin_email so single-tenant setups Just Work.
-	// Multi-user setups should front the dashboard with an auth proxy
-	// (Cloudflare Access, basic auth, etc) that fills the real user.
-	wgMode := !strings.EqualFold(w.g.cfg.Tailscale.Control, "tailscale") &&
-		w.g.cfg.Tailscale.Control != ""
-	if wgMode && w.g.cfg.AdminEmail != "" && !strings.Contains(owner, "@") {
-		owner = w.g.cfg.AdminEmail
-	}
 	if owner == "" {
-		http.Error(rw, "approval requires an authenticated tailnet caller (or set admin_email in gateway.yaml)", 403)
+		http.Error(rw, "approval requires an authenticated tailnet caller (or set admin_email in gateway.hcl)", 403)
 		return
 	}
 	code := r.URL.Query().Get("code")
@@ -937,6 +1052,14 @@ func (w *webMux) apiOnboardApprove(rw http.ResponseWriter, r *http.Request) {
 		// public gateway URL becomes unreachable).
 		if peerIP != "" {
 			w.onboard.ClaimIP(dc, peerIP)
+			if len(w.g.cfg.Profiles) > 0 {
+				w.onboard.AssignProfile(peerIP, w.g.cfg.Profiles[0].Name)
+			}
+			// Seed the agents registry so the dashboard shows the
+			// device immediately, before it sends any traffic.
+			if w.g.agents != nil {
+				w.g.agents.Seed(peerIP)
+			}
 		}
 	}()
 	writeJSON(rw, map[string]any{"approved": true})
@@ -1040,16 +1163,24 @@ type Event struct {
 }
 
 type Sink struct {
-	ch    chan Event
-	file  *os.File
-	drops atomic.Uint64
-	mu    sync.Mutex
-	subs  []chan Event
+	ch        chan Event
+	file      *os.File
+	drops     atomic.Uint64
+	mu        sync.Mutex
+	subs      []chan Event
+	recent    []Event // ring of recent events for backlog replay
+	recentCap int
 }
 
 func NewSink(path string, buf int) (*Sink, error) {
-	s := &Sink{ch: make(chan Event, buf)}
+	s := &Sink{ch: make(chan Event, buf), recentCap: 500}
 	if path != "" {
+		// Seed the in-memory backlog from the on-disk JSONL so a
+		// dashboard reload after a gateway restart still shows the last
+		// N events instead of an empty stream.
+		if seed, err := readTailEvents(path, s.recentCap); err == nil && len(seed) > 0 {
+			s.recent = seed
+		}
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, err
@@ -1058,6 +1189,33 @@ func NewSink(path string, buf int) (*Sink, error) {
 	}
 	go s.drain()
 	return s, nil
+}
+
+func readTailEvents(path string, n int) ([]Event, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	dec := json.NewDecoder(f)
+	out := make([]Event, 0, n)
+	for {
+		var e Event
+		if err := dec.Decode(&e); err != nil {
+			if err == io.EOF {
+				break
+			}
+			break // tolerate a truncated tail
+		}
+		out = append(out, e)
+		if len(out) > n*2 {
+			out = out[len(out)-n:]
+		}
+	}
+	if len(out) > n {
+		out = out[len(out)-n:]
+	}
+	return out, nil
 }
 
 func (s *Sink) Emit(e Event) {
@@ -1083,6 +1241,10 @@ func (s *Sink) drain() {
 			_ = enc.Encode(e)
 		}
 		s.mu.Lock()
+		s.recent = append(s.recent, e)
+		if len(s.recent) > s.recentCap {
+			s.recent = s.recent[len(s.recent)-s.recentCap:]
+		}
 		for _, sub := range s.subs {
 			select {
 			case sub <- e:
@@ -1094,14 +1256,19 @@ func (s *Sink) drain() {
 	}
 }
 
-func (s *Sink) Subscribe() (<-chan Event, func()) {
+// RecentAndSubscribe atomically snapshots the backlog and registers a
+// subscriber under the same lock so no event is missed or duplicated
+// between the two. Caller should write the snapshot first, then loop on
+// the channel for new events.
+func (s *Sink) RecentAndSubscribe() ([]Event, <-chan Event, func()) {
 	if s == nil {
 		ch := make(chan Event)
 		close(ch)
-		return ch, func() {}
+		return nil, ch, func() {}
 	}
 	ch := make(chan Event, 64)
 	s.mu.Lock()
+	snap := append([]Event(nil), s.recent...)
 	s.subs = append(s.subs, ch)
 	s.mu.Unlock()
 	cancel := func() {
@@ -1114,6 +1281,11 @@ func (s *Sink) Subscribe() (<-chan Event, func()) {
 		}
 		s.mu.Unlock()
 	}
+	return snap, ch, cancel
+}
+
+func (s *Sink) Subscribe() (<-chan Event, func()) {
+	_, ch, cancel := s.RecentAndSubscribe()
 	return ch, cancel
 }
 
@@ -1202,7 +1374,8 @@ type HITLPending struct {
 	Path       string    `json:"path"`
 	UA         string    `json:"ua,omitempty"`
 	BodySample string    `json:"body_sample,omitempty"`
-	Reason     string    `json:"reason,omitempty"` // rule.Reason — operator-supplied "why approval needed"
+	Reason     string    `json:"reason,omitempty"`
+	Approvers  []string  `json:"approvers,omitempty"` // names from rule.Approve
 	CreatedAt  time.Time `json:"created_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	decision   chan HITLDecision

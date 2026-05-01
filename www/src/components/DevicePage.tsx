@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { deleteAgent, type Agent, type Integration, type Whoami } from "../lib/api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { deleteAgent, listProfiles, setDeviceProfile, type Agent, type Integration, type Whoami } from "../lib/api";
 import { fmtBytes } from "../lib/format";
 import { DeviceIcon } from "./Logos";
 import { Sparkline } from "./Sparkline";
@@ -26,6 +26,12 @@ export function DevicePage({
   onRefresh: () => void;
 }) {
   const a = useMemo(() => agents.find((x) => x.ip === ip) ?? null, [agents, ip]);
+  const [profiles, setProfiles] = useState<string[]>([]);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileErr, setProfileErr] = useState<string | null>(null);
+  useEffect(() => {
+    listProfiles().then(setProfiles).catch(() => setProfiles([]));
+  }, []);
   if (!a) {
     return (
       <main className="mx-auto w-full max-w-[1100px] px-4 sm:px-6 py-5">
@@ -60,13 +66,41 @@ export function DevicePage({
         <button onClick={onBack} className="text-[11px] text-[#737373] hover:text-[#171717]">
           ← back
         </button>
-        <button
-          onClick={remove}
-          className="text-[11px] text-[#a3a3a3] hover:text-[#dc2626] transition-colors"
-          title="forget this device"
-        >
-          delete device
-        </button>
+        <div className="flex items-center gap-2">
+          <ProfilePicker
+            current={a.profile ?? ""}
+            profiles={profiles}
+            saving={profileSaving}
+            err={profileErr}
+            onPick={async (next) => {
+              if (!next || next === a.profile) return;
+              setProfileSaving(true);
+              setProfileErr(null);
+              try {
+                await setDeviceProfile(a.ip, next);
+                onRefresh();
+              } catch (err: any) {
+                setProfileErr(String(err.message ?? err));
+              } finally {
+                setProfileSaving(false);
+              }
+            }}
+          />
+          <button
+            type="button"
+            onClick={remove}
+            title="forget this device"
+            className="w-[36px] h-[36px] rounded-full border border-[#e5e5e5] text-[#525252] flex items-center justify-center hover:border-[#dc2626] hover:text-[#dc2626] transition-colors"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 6h18" />
+              <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+              <path d="M10 11v6" />
+              <path d="M14 11v6" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {/* device header card */}
@@ -109,7 +143,87 @@ export function DevicePage({
       />
 
       {/* rules — per-device scope (with global rules layered in) */}
-      <RulesPanel deviceIP={a.ip} />
+      <RulesPanel deviceIP={a.ip} profile={a.profile} />
     </main>
+  );
+}
+
+function ProfilePicker({
+  current,
+  profiles,
+  saving,
+  err,
+  onPick,
+}: {
+  current: string;
+  profiles: string[];
+  saving: boolean;
+  err: string | null;
+  onPick: (next: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  const disabled = saving || profiles.length === 0;
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((v) => !v)}
+        title={`profile: ${current || "—"}`}
+        className="w-[36px] h-[36px] rounded-full border border-[#e5e5e5] text-[#525252] flex items-center justify-center hover:border-[#171717] hover:text-[#171717] transition-colors disabled:opacity-50"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12 2 2 7l10 5 10-5-10-5z" />
+          <path d="M2 17l10 5 10-5" />
+          <path d="M2 12l10 5 10-5" />
+        </svg>
+      </button>
+      {open && (
+        <div className="absolute right-0 top-[calc(100%+6px)] z-20 min-w-[200px] bg-white border border-[#e5e5e5] rounded shadow-lg py-1">
+          <div className="px-3 py-1.5 text-[9px] uppercase tracking-[.12em] text-[#a3a3a3] border-b border-[#f5f5f5]">
+            choose profile
+          </div>
+          {profiles.length === 0 ? (
+            <div className="px-3 py-2 text-[11px] text-[#a3a3a3]">no profiles</div>
+          ) : (
+            profiles.map((p) => {
+              const active = p === current;
+              return (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => {
+                    onPick(p);
+                    setOpen(false);
+                  }}
+                  className={
+                    "w-full text-left px-3 py-1.5 text-[12px] flex items-center gap-2 hover:bg-[#f5f5f5] " +
+                    (active ? "text-[#171717] font-medium" : "text-[#525252]")
+                  }
+                >
+                  <span
+                    className={
+                      "w-[6px] h-[6px] rounded-full flex-shrink-0 " +
+                      (active ? "bg-[#22c55e]" : "border border-[#e5e5e5]")
+                    }
+                  />
+                  <span className="truncate">{p}</span>
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
+      {err && <div className="text-[9px] text-red-600 mt-1">{err}</div>}
+    </div>
   );
 }

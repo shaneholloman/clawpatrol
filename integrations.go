@@ -98,13 +98,17 @@ func runEnv(args []string) {
 // can override any field by also defining the same id in config; user
 // values win.
 
+// integrationDefault bundles an OAuth definition with the hosts it
+// applies to. Auto-MITM happens for any host in `Hosts` whenever the
+// integration is named in `integrations = [...]`.
 type integrationDefault struct {
 	OAuth *OAuthIntegration
-	Rules []Rule
+	Hosts []string // SNI hosts this integration covers
 }
 
 var defaultIntegrations = map[string]integrationDefault{
 	"claude": {
+		Hosts: []string{"api.anthropic.com"},
 		OAuth: &OAuthIntegration{
 			ID:     "claude",
 			Type:   "oauth2",
@@ -119,16 +123,9 @@ var defaultIntegrations = map[string]integrationDefault{
 				RefreshToken: "{{secret:CLAUDE_REFRESH}}",
 			},
 		},
-		Rules: []Rule{
-			{
-				Host:  "api.anthropic.com",
-				Auth:  "claude",
-				Track: "claude_usage",
-			},
-		},
 	},
-
 	"codex": {
+		Hosts: []string{"api.openai.com", "chatgpt.com"},
 		OAuth: &OAuthIntegration{
 			ID:     "codex",
 			Type:   "oauth2",
@@ -143,58 +140,202 @@ var defaultIntegrations = map[string]integrationDefault{
 				RefreshToken: "{{secret:CODEX_REFRESH}}",
 			},
 		},
-		Rules: []Rule{
-			{Host: "api.openai.com", Auth: "codex", Track: "openai_usage"},
-			// Codex CLI uses wss://chatgpt.com/backend-api/codex/responses.
-			// Cloudflare flags non-browser TLS fingerprints; we use
-			// uTLS (HelloChrome_Auto) for upstream — see dial.go.
-			{Host: "chatgpt.com", WSScan: true, Track: "codex_ws_usage"},
-		},
 	},
-
 	"github": {
-		// gh CLI's published OAuth client_id (no secret needed —
-		// GitHub's OAuth device flow is designed for public clients).
+		Hosts: []string{"api.github.com", "raw.githubusercontent.com"},
 		OAuth: &OAuthIntegration{
+			// gh CLI's published OAuth client_id (no secret needed —
+			// device flow is designed for public clients).
 			ID:     "github",
 			Type:   "oauth2",
 			Header: "Authorization",
 			Prefix: "Bearer ",
 			Flow:   "device",
 			OAuth: OAuthConfig{
-				// gh CLI's OAuth App client_id (public, supports device flow).
-				// See github.com/cli/cli/internal/authflow/flow.go.
 				ClientID:  "178c6fc778ccc68e1d6a",
 				DeviceURL: "https://github.com/login/device/code",
 				TokenURL:  "https://github.com/login/oauth/access_token",
 				Scopes:    []string{"repo", "read:org", "gist", "workflow"},
 			},
 		},
-		Rules: []Rule{
-			{Host: "api.github.com", Auth: "github"},
-			{Host: "raw.githubusercontent.com", Auth: "github"},
-		},
 	},
 }
 
-// expandDefaults merges built-in defaults for ids in cfg.IntegrationNames
-// into the config. Existing user-defined entries with same id win.
+// expandDefaults walks every Profile (resolving `extend` first) and
+// folds in:
+//   - parent profiles' integrations / rulesets / inline rules
+//     (recursively, child wins on host conflicts)
+//   - inline `rule {}` blocks declared in the profile
+//   - rules from any `ruleset "name"` referenced via `rules = [...]`
+//   - auto-derived rules for each named integration's hosts (skipped
+//     when the profile already declared a rule for that host)
+//
+// Validation:
+//   - every name in `Approve` must be "dashboard" or a declared Approver.
+//   - every name in `RulesetRefs` must resolve to a declared Ruleset.
+//   - every `IntegrationNames` entry must be a known built-in.
+//   - `extend` chain must not contain cycles.
+//
+// Every emitted rule is tagged with Profile=<profile-name> so
+// selectHostRule can filter by peer→profile mapping.
 func expandDefaults(cfg *Config) error {
-	have := map[string]bool{}
+	cfg.Rules = nil
+	haveOAuth := map[string]bool{}
 	for _, o := range cfg.OAuth {
-		have[o.ID] = true
+		haveOAuth[o.ID] = true
 	}
-
-	for _, name := range cfg.IntegrationNames {
-		def, ok := defaultIntegrations[name]
+	rulesetByName := map[string][]Rule{}
+	for _, rs := range cfg.Rulesets {
+		rulesetByName[rs.Name] = rs.Rules
+	}
+	profileByName := map[string]*Profile{}
+	for i := range cfg.Profiles {
+		profileByName[cfg.Profiles[i].Name] = &cfg.Profiles[i]
+	}
+	approverNames := map[string]bool{"dashboard": true}
+	for _, a := range cfg.Approvers {
+		if a.Name == "dashboard" {
+			return fmt.Errorf("approver name %q is reserved (built-in)", a.Name)
+		}
+		approverNames[a.Name] = true
+	}
+	validateApprove := func(profile string, r Rule) error {
+		for _, n := range r.Approve {
+			if !approverNames[n] {
+				return fmt.Errorf("profile %q rule for %q: unknown approver %q (declare it via `approver %q { ... }`)",
+					profile, r.Host, n, n)
+			}
+		}
+		return nil
+	}
+	// resolved[name] = the flattened (integrations, ruleset-refs,
+	// inline rules) for that profile, parents already merged in.
+	type resolved struct {
+		integrations []string
+		rulesets     []string
+		rules        []Rule
+	}
+	cache := map[string]resolved{}
+	visiting := map[string]bool{}
+	var resolve func(name string) (resolved, error)
+	resolve = func(name string) (resolved, error) {
+		if r, ok := cache[name]; ok {
+			return r, nil
+		}
+		if visiting[name] {
+			return resolved{}, fmt.Errorf("profile %q: cycle in extend chain", name)
+		}
+		visiting[name] = true
+		defer delete(visiting, name)
+		p, ok := profileByName[name]
 		if !ok {
-			return fmt.Errorf("unknown integration: %q (available: %v)", name, defaultIntegrationKeys())
+			return resolved{}, fmt.Errorf("profile %q: extends unknown profile", name)
 		}
-		if def.OAuth != nil && !have[def.OAuth.ID] {
-			cfg.OAuth = append(cfg.OAuth, *def.OAuth)
-			have[def.OAuth.ID] = true
+		out := resolved{}
+		for _, parent := range p.Extends {
+			pr, err := resolve(parent)
+			if err != nil {
+				return resolved{}, err
+			}
+			out.integrations = append(out.integrations, pr.integrations...)
+			out.rulesets = append(out.rulesets, pr.rulesets...)
+			out.rules = append(out.rules, pr.rules...)
 		}
-		cfg.Rules = append(cfg.Rules, def.Rules...)
+		out.integrations = append(out.integrations, p.IntegrationNames...)
+		out.rulesets = append(out.rulesets, p.RulesetRefs...)
+		out.rules = append(out.rules, p.Rules...)
+		cache[name] = out
+		return out, nil
+	}
+	for _, p := range cfg.Profiles {
+		flat, err := resolve(p.Name)
+		if err != nil {
+			return err
+		}
+		// declared tracks hosts that already have a CATCH-ALL rule
+		// (Match == nil). Subsequent catch-alls for the same host
+		// (e.g. integration-derived auto-rules) are skipped.
+		// Rules with a Match are always emitted — they're specific
+		// policy and should coexist with other specific rules.
+		declared := map[string]bool{}
+		emit := func(r Rule) error {
+			if r.Device == "" && r.Match == nil && declared[r.Host] {
+				return nil
+			}
+			r.Profile = p.Name
+			if err := validateApprove(p.Name, r); err != nil {
+				return err
+			}
+			cfg.Rules = append(cfg.Rules, r)
+			if r.Device == "" && r.Match == nil {
+				declared[r.Host] = true
+			}
+			return nil
+		}
+		// Walk in REVERSE so child contributions (appended last) are
+		// emitted first and win the host-declared check above.
+		for i := len(flat.rules) - 1; i >= 0; i-- {
+			if err := emit(flat.rules[i]); err != nil {
+				return err
+			}
+		}
+		for i := len(flat.rulesets) - 1; i >= 0; i-- {
+			rs, ok := rulesetByName[flat.rulesets[i]]
+			if !ok {
+				return fmt.Errorf("profile %q: unknown ruleset %q", p.Name, flat.rulesets[i])
+			}
+			for j := len(rs) - 1; j >= 0; j-- {
+				if err := emit(rs[j]); err != nil {
+					return err
+				}
+			}
+		}
+		// Integrations: dedupe across the whole extend chain.
+		// Built-ins are wired (auto-rules from default hosts).
+		// Operator-declared `integration "name" {}` blocks register
+		// the name + (optional) host list — auto-rules emit too;
+		// secret-injection behavior is per-owner via dashboard
+		// (wired in a later pass).
+		custom := map[string]Integration{}
+		for _, in := range cfg.Integrations {
+			custom[in.Name] = in
+		}
+		seenInt := map[string]bool{}
+		for _, name := range flat.integrations {
+			if seenInt[name] {
+				continue
+			}
+			seenInt[name] = true
+			if def, ok := defaultIntegrations[name]; ok {
+				if def.OAuth != nil && !haveOAuth[def.OAuth.ID] {
+					cfg.OAuth = append(cfg.OAuth, *def.OAuth)
+					haveOAuth[def.OAuth.ID] = true
+				}
+				for _, host := range def.Hosts {
+					if declared[host] {
+						continue
+					}
+					if err := emit(Rule{Host: host, Auth: name}); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if in, ok := custom[name]; ok {
+				for _, host := range in.Hosts {
+					if declared[host] {
+						continue
+					}
+					if err := emit(Rule{Host: host, Auth: name}); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			available := append(defaultIntegrationKeys(), customIntegrationKeys(cfg.Integrations)...)
+			return fmt.Errorf("profile %q: unknown integration %q (available: %v)",
+				p.Name, name, available)
+		}
 	}
 	return nil
 }
@@ -207,19 +348,25 @@ func defaultIntegrationKeys() []string {
 	return out
 }
 
+func customIntegrationKeys(ins []Integration) []string {
+	out := make([]string, 0, len(ins))
+	for _, in := range ins {
+		out = append(out, in.Name)
+	}
+	return out
+}
+
 func defaultOAuthByID(id string) *OAuthIntegration {
-	if d, ok := defaultIntegrations[id]; ok && d.OAuth != nil {
+	if d, ok := defaultIntegrations[id]; ok {
 		return d.OAuth
 	}
 	return nil
 }
 
 func defaultOAuthKeys() []string {
-	out := []string{}
-	for k, d := range defaultIntegrations {
-		if d.OAuth != nil {
-			out = append(out, k)
-		}
+	out := make([]string, 0, len(defaultIntegrations))
+	for k := range defaultIntegrations {
+		out = append(out, k)
 	}
 	return out
 }

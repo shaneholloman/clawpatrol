@@ -15,8 +15,13 @@ export type EventRecord = {
   reason?: string;
 };
 
-export function LiveRequests({ agentIP, max = 200, height }: { agentIP?: string; max?: number; height?: string }) {
+export function LiveRequests({ agentIP, max = 200, height }: {
+  agentIP?: string;
+  max?: number;
+  height?: string;
+}) {
   const [events, setEvents] = useState<EventRecord[]>([]);
+
   useEffect(() => {
     setEvents([]);
     const url = agentIP
@@ -51,6 +56,14 @@ export function LiveRequests({ agentIP, max = 200, height }: { agentIP?: string;
   );
 }
 
+// pathSeparator: HTTP paths start with "/", so they visually butt up
+// against the host fine. SQL "paths" (`SELECT now()`) need a space so
+// the row reads `66.42.120.196 SELECT now()` not `66.42.120.196SELECT`.
+function pathSeparator(path: string): string {
+  if (!path) return "";
+  return path.startsWith("/") ? "" : " ";
+}
+
 function Row({ ev }: { ev: EventRecord }) {
   const t = new Date(ev.ts);
   const time =
@@ -62,6 +75,8 @@ function Row({ ev }: { ev: EventRecord }) {
     : status >= 300 ? "text-[#ca8a04]"
     : status >= 200 ? "text-[#16a34a]"
     : "text-[#737373]";
+  const path = ev.path ?? "";
+  const sep = pathSeparator(path);
   return (
     <div className="px-4 py-2 border-b border-[#f5f5f5] hover:bg-[#f9f9f9] flex items-center gap-3 min-w-0">
       <span className="text-[10px] tabular-nums text-[#a3a3a3] flex-shrink-0">{time}</span>
@@ -70,9 +85,10 @@ function Row({ ev }: { ev: EventRecord }) {
         <span className="text-[10px] uppercase font-semibold text-[#525252] flex-shrink-0 w-[44px]">{ev.method}</span>
       )}
       <span className={"text-[11px] tabular-nums flex-shrink-0 w-[36px] " + statusColor}>{status || "—"}</span>
-      <span className="text-[12px] text-[#171717] truncate flex-1 min-w-0" title={ev.host + (ev.path ?? "")}>
+      <span className="text-[12px] text-[#171717] truncate flex-1 min-w-0" title={ev.host + sep + path}>
         <span className="text-[#737373]">{ev.host}</span>
-        <span>{ev.path ?? ""}</span>
+        {sep && <span> </span>}
+        <span>{path}</span>
       </span>
       <span className="text-[10px] tabular-nums text-[#a3a3a3] flex-shrink-0">{ev.ms}ms</span>
     </div>

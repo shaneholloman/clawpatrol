@@ -18,6 +18,7 @@ type Agent struct {
 	IP           string     `json:"ip"`
 	Hostname     string     `json:"hostname"`
 	User         string     `json:"user"`
+	Profile      string     `json:"profile,omitempty"`
 	OS           string     `json:"os"`
 	UA           string     `json:"ua"`
 	FirstAt      time.Time  `json:"first_at"`
@@ -109,9 +110,10 @@ func detectAgentTypeFromHost(host string) string {
 }
 
 type AgentRegistry struct {
-	mu     sync.RWMutex
-	agents map[string]*Agent
-	lc     *local.Client
+	mu      sync.RWMutex
+	agents  map[string]*Agent
+	lc      *local.Client
+	onboard *onboardRegistry // set by Gateway ctor; supplies hostname/owner overrides in WG mode
 }
 
 const activityBuckets = 30 // ~30s history at 1s sampling
@@ -159,6 +161,32 @@ func (r *AgentRegistry) sampleLoop() {
 	}
 }
 
+// Seed creates an empty agent entry for ip if missing. Called at
+// onboard-approve time so the device appears in the dashboard before
+// it sends any traffic. Hostname / owner are pulled from
+// onboardRegistry overrides.
+func (r *AgentRegistry) Seed(ip string) {
+	if ip == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.agents[ip]; ok {
+		return
+	}
+	now := time.Now().UTC()
+	a := &Agent{IP: ip, FirstAt: now, LastAt: now}
+	if r.onboard != nil {
+		if hn := r.onboard.HostnameForIP(ip); hn != "" {
+			a.Hostname = hn
+		}
+		if owner := r.onboard.OwnerForIP(ip); owner != "" {
+			a.User = owner
+		}
+	}
+	r.agents[ip] = a
+}
+
 func (r *AgentRegistry) track(remoteAddr, host string, in, out int64) {
 	r.trackUA(remoteAddr, host, "", in, out)
 }
@@ -174,6 +202,16 @@ func (r *AgentRegistry) trackUA(remoteAddr, host, ua string, in, out int64) {
 	a, ok := r.agents[ip]
 	if !ok {
 		a = &Agent{IP: ip, FirstAt: now}
+		// WG-mode override: hostname captured at `clawpatrol join` time.
+		// Tailscale whois fills more (User, OS) — see fillIdentity.
+		if r.onboard != nil {
+			if hn := r.onboard.HostnameForIP(ip); hn != "" {
+				a.Hostname = hn
+			}
+			if owner := r.onboard.OwnerForIP(ip); owner != "" {
+				a.User = owner
+			}
+		}
 		r.agents[ip] = a
 		go r.fillIdentity(ip)
 	}
@@ -283,6 +321,9 @@ func (r *AgentRegistry) snapshot() []*Agent {
 	out := make([]*Agent, 0, len(r.agents))
 	for _, a := range r.agents {
 		cp := *a
+		if r.onboard != nil {
+			cp.Profile = r.onboard.ProfileForIP(a.IP)
+		}
 		if a.Activity != nil {
 			cp.Activity = append([]int(nil), a.Activity...)
 		}

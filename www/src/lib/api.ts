@@ -30,6 +30,7 @@ export type Agent = {
   ip: string;
   hostname: string;
   user: string;
+  profile?: string;
   os: string;
   ua?: string;
   first_at: string;
@@ -46,6 +47,7 @@ export type Agent = {
 export type RuleSummary = {
   host: string;
   device?: string;
+  profile?: string;
   port?: number;
   action?: string;
   reason?: string;
@@ -66,17 +68,22 @@ export async function getRules(): Promise<RuleSummary[]> {
   return r.json();
 }
 
-export async function getRulesYAML(): Promise<string> {
-  const r = await fetch("/api/rules?format=yaml");
+// Rules API speaks JSON on the wire. The editor pretty-prints the
+// rules array so an operator can see/edit each rule's fields directly.
+// (HCL is the on-disk format; JSON is just the dashboard transport.)
+
+export async function getRulesJSON(): Promise<string> {
+  const r = await fetch("/api/rules");
   if (!r.ok) throw new Error(await r.text());
-  return r.text();
+  const data = await r.json();
+  return JSON.stringify(data ?? [], null, 2);
 }
 
-export async function putRulesYAML(yaml: string): Promise<{ ok: boolean; count: number }> {
+export async function putRulesJSON(json: string): Promise<{ ok: boolean; count: number }> {
   const r = await fetch("/api/rules", {
     method: "PUT",
-    headers: { "Content-Type": "application/x-yaml" },
-    body: yaml,
+    headers: { "Content-Type": "application/json" },
+    body: json,
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
@@ -88,17 +95,66 @@ export async function getDeviceRules(ip: string): Promise<RuleSummary[]> {
   return r.json();
 }
 
-export async function getDeviceRulesYAML(ip: string): Promise<string> {
-  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}&format=yaml`);
+export async function getDeviceRulesJSON(ip: string): Promise<string> {
+  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}`);
+  if (!r.ok) throw new Error(await r.text());
+  const data = await r.json();
+  return JSON.stringify(data ?? [], null, 2);
+}
+
+export async function putDeviceRulesJSON(ip: string, json: string): Promise<{ ok: boolean; count: number }> {
+  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: json,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// HCL editors. Both /api/config (full gateway.hcl) and the
+// device-scoped /api/rules/device?format=hcl path return raw HCL text.
+
+export async function getConfigHCL(): Promise<string> {
+  const r = await fetch("/api/config");
   if (!r.ok) throw new Error(await r.text());
   return r.text();
 }
 
-export async function putDeviceRulesYAML(ip: string, yaml: string): Promise<{ ok: boolean; count: number }> {
-  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}`, {
+export async function putConfigHCL(hcl: string): Promise<{ ok: boolean; bytes: number }> {
+  const r = await fetch("/api/config", {
     method: "PUT",
-    headers: { "Content-Type": "application/x-yaml" },
-    body: yaml,
+    headers: { "Content-Type": "text/plain" },
+    body: hcl,
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function getDeviceRulesHCL(ip: string): Promise<string> {
+  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}&format=hcl`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.text();
+}
+
+export async function listProfiles(): Promise<string[]> {
+  const r = await fetch("/api/profiles");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function setDeviceProfile(ip: string, profile: string): Promise<void> {
+  const r = await fetch(`/api/agents/profile?ip=${encodeURIComponent(ip)}&profile=${encodeURIComponent(profile)}`, {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export async function putDeviceRulesHCL(ip: string, hcl: string): Promise<{ ok: boolean; count: number }> {
+  const r = await fetch(`/api/rules/device?ip=${encodeURIComponent(ip)}&format=hcl`, {
+    method: "PUT",
+    headers: { "Content-Type": "text/plain" },
+    body: hcl,
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();

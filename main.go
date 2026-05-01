@@ -21,109 +21,428 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gopkg.in/yaml.v3"
+	"github.com/hashicorp/hcl/v2/hclsimple"
+	"github.com/hashicorp/hcl/v2/hclwrite"
+	"github.com/zclconf/go-cty/cty"
 )
 
+// Config is the on-disk gateway configuration. Decoded from HCL via
+// hclsimple.DecodeFile. Hot-reloadable: Profiles + AdminEmail. Listen
+// ports / CA dir / OAuth dir / Tailscale block require restart.
 type Config struct {
-	Listen           string             `yaml:"listen"`
-	InfoListen       string             `yaml:"info_listen"`
-	PublicURL        string             `yaml:"public_url"` // shown in dashboard "add device" modal so new clients reach gateway from public internet
-	// AdminEmail is the operator's identity in single-tenant
-	// (wireguard / proxy) mode where there's no tailnet whois. All
-	// onboard approvals get attributed to this email so per-user
-	// OAuth credential lookup works.
-	AdminEmail string `yaml:"admin_email,omitempty"`
-	CADir            string             `yaml:"ca_dir"`
-	Resolver         string             `yaml:"resolver"`
-	LogPath          string             `yaml:"log_path"`
-	OAuthDir         string             `yaml:"oauth_dir"`
-	Tailscale        Tailscale          `yaml:"tailscale"`
-	IntegrationNames []string           `yaml:"integrations"`
-	OAuth            []OAuthIntegration `yaml:"oauth"`
-	Rules            []Rule             `yaml:"rules"`
+	Listen     string `hcl:"listen,optional"`
+	InfoListen string `hcl:"info_listen,optional"`
+	// PublicURL is shown in the dashboard "add device" modal so new
+	// clients reach the gateway from the public internet.
+	PublicURL string `hcl:"public_url,optional"`
+	// AdminEmail is the dashboard caller's identity in WG mode (no
+	// tailnet whois). The dashboard auto-approves onboarding requests
+	// against it.
+	AdminEmail string     `hcl:"admin_email,optional"`
+	CADir      string     `hcl:"ca_dir,optional"`
+	Resolver   string     `hcl:"resolver,optional"`
+	LogPath    string     `hcl:"log_path,optional"`
+	OAuthDir   string     `hcl:"oauth_dir,optional"`
+	Tailscale    *Tailscale    `hcl:"tailscale,block"`
+	Profiles     []Profile     `hcl:"profile,block"`
+	Rulesets     []Ruleset     `hcl:"ruleset,block"`
+	Approvers    []Approver    `hcl:"approver,block"`
+	Integrations []Integration `hcl:"integration,block"`
+
+	// Rules + OAuth are not decoded from HCL — populated by
+	// expandDefaults() from the configured Profiles + Rulesets.
+	Rules []Rule
+	OAuth []OAuthIntegration
+}
+
+// Profile binds integrations + rulesets + inline rules. Each onboarded
+// device gets a profile at approval time.
+type Profile struct {
+	Name string `hcl:"name,label"`
+	// Extends names other profiles to inherit from. Parent
+	// integrations / rulesets / inline rules are folded in BEFORE
+	// this profile's own contributions, so child rules with the
+	// same Host override parent rules.
+	Extends          []string `hcl:"extend,optional"`
+	IntegrationNames []string `hcl:"integrations,optional"`
+	// RulesetRefs reference top-level Ruleset blocks by name. Names
+	// must resolve to a declared ruleset; otherwise expandDefaults
+	// returns an error.
+	RulesetRefs []string `hcl:"rules,optional"`
+	// Rules are inline policy specific to this profile. Composed
+	// alongside referenced rulesets.
+	Rules []Rule `hcl:"rule,block"`
+}
+
+// Ruleset is a named bundle of rules. Profiles compose rulesets via
+// `rules = ["name", ...]`. Same Rule shape as inline profile rules.
+type Ruleset struct {
+	Name  string `hcl:"name,label"`
+	Rules []Rule `hcl:"rule,block"`
+}
+
+// Integration declares the auth shape for a set of hosts. Schema is
+// wired; behavior (per-owner secret storage + injection at MITM time)
+// is the next pass. Built-in OAuth integrations (claude/codex/github)
+// stay declared in code; custom integrations live in the operator's
+// HCL config.
+type Integration struct {
+	Name       string   `hcl:"name,label"`
+	Type       string   `hcl:"type"` // oauth | bearer | header | cookie | mtls
+	Hosts      []string `hcl:"hosts,optional"`
+	Header     string   `hcl:"header,optional"`     // type=header
+	Prefix     string   `hcl:"prefix,optional"`     // type=header / bearer
+	CookieName string   `hcl:"cookie_name,optional"` // type=cookie
+}
+
+// Approver is a HITL notifier. The "dashboard" name is reserved for
+// the always-available built-in (no declaration needed). Operators
+// declare slack/llm/etc. via this block and reference by name in
+// `rule { approve = ["..."] }`.
+type Approver struct {
+	Name    string `hcl:"name,label"`
+	Type    string `hcl:"type"` // "dashboard" | "slack" | "llm"
+	Channel string `hcl:"channel,optional"`
+	Timeout int    `hcl:"timeout,optional"` // seconds; 0 → 60s default
+	Model   string `hcl:"model,optional"`   // type=llm
+	Policy  string `hcl:"policy,optional"`  // type=llm — judge prompt
 }
 
 type Tailscale struct {
-	AuthKey    string `yaml:"authkey"`
-	ControlURL string `yaml:"control_url"`
-	Hostname   string `yaml:"hostname"`
-	StateDir   string `yaml:"state_dir"`
-
+	AuthKey    string `hcl:"authkey,optional"`
+	ControlURL string `hcl:"control_url,optional"`
+	Hostname   string `hcl:"hostname,optional"`
+	StateDir   string `hcl:"state_dir,optional"`
 	// Control is "tailscale" (default) or "wireguard". Picks which
 	// onboarder mints auth-keys when new clients run `clawpatrol join`.
-	Control string `yaml:"control"`
-
-	// OAuth client used to mint single-use auth-keys for new clients
-	// during `clawpatrol login --url ...` device-flow onboarding. Create
-	// an OAuth client at https://login.tailscale.com/admin/settings/oauth
-	// with the `auth_keys` scope.  (control=tailscale)
-	OAuthClientID     string   `yaml:"oauth_client_id"`
-	OAuthClientSecret string   `yaml:"oauth_client_secret"`
-	Tags              []string `yaml:"tags"` // tags applied to onboarded devices, e.g. ["tag:client"]
-
-	// Plain WireGuard self-host. (control=wireguard)
-	// Gateway runs `wg-quick` on its own, mints a peer config per
-	// onboard. No control server, no SaaS.
-	WGInterface  string `yaml:"wg_interface"`   // e.g. "wg0"
-	WGEndpoint   string `yaml:"wg_endpoint"`    // public host:port for AllowedIPs routing
-	WGServerPub  string `yaml:"wg_server_pub"`  // gateway's wg public key
-	WGSubnetCIDR string `yaml:"wg_subnet_cidr"` // pool we allocate from, e.g. "10.42.0.0/24"
+	Control string `hcl:"control,optional"`
+	// (control=tailscale) OAuth client to mint single-use auth-keys.
+	OAuthClientID     string   `hcl:"oauth_client_id,optional"`
+	OAuthClientSecret string   `hcl:"oauth_client_secret,optional"`
+	Tags              []string `hcl:"tags,optional"`
+	// (control=wireguard) Plain WG self-host. Gateway IS the endpoint.
+	WGInterface  string `hcl:"wg_interface,optional"`
+	WGEndpoint   string `hcl:"wg_endpoint,optional"`
+	WGServerPub  string `hcl:"wg_server_pub,optional"`
+	WGSubnetCIDR string `hcl:"wg_subnet_cidr,optional"`
 }
 
+// Rule is a host-scoped policy: SNI matches Host, then optional Match
+// gates per-request, then Action / Auth / Swap / Headers apply.
+//
+// Tags carry both `hcl` (gateway config decode) and `yaml` + `json`
+// (dashboard rule-editor API uses yaml on the wire; events emit JSON).
 type Rule struct {
-	// Device scopes the rule. Empty = global (applies to all peers).
-	// Otherwise matched against the peer's tailnet IP.
-	// Device-scoped rules take precedence over globals.
-	Device   string            `yaml:"device,omitempty" json:"device,omitempty"`
-	Host     string            `yaml:"host" json:"host"`
-	Port     int               `yaml:"port,omitempty" json:"port,omitempty"`
-	Match    *Match            `yaml:"match,omitempty" json:"match,omitempty"`
-	Action   string            `yaml:"action,omitempty" json:"action,omitempty"`
-	Reason   string            `yaml:"reason,omitempty" json:"reason,omitempty"`
-	Headers  map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
-	Swap     []Swap            `yaml:"swap,omitempty" json:"swap,omitempty"`
-	WSScan   bool              `yaml:"ws_scan,omitempty" json:"ws_scan,omitempty"`
-	Body     bool              `yaml:"body,omitempty" json:"body,omitempty"`
-	Upstream string            `yaml:"upstream,omitempty" json:"upstream,omitempty"`
-	Auth     string            `yaml:"auth,omitempty" json:"auth,omitempty"`
-	Track    string            `yaml:"track,omitempty" json:"track,omitempty"` // "claude_usage" | "openai_usage"
-	// Action="hitl" pauses the request, asks for human approval via
-	// the dashboard (and any registered notifier plugin like web-push
-	// or slack). HITLTimeout caps the wait; default 60s. On timeout
-	// the request is denied.
-	HITLTimeout int `yaml:"hitl_timeout,omitempty" json:"hitl_timeout,omitempty"` // seconds
-	// MTLS configures the gateway-to-upstream client certificate
-	// presented when dialing this rule's host. Used for endpoints
-	// like the Kubernetes API server that authenticate via client
-	// cert rather than a bearer token. Paths point at PEM files
-	// readable by the gateway process.
-	MTLS *MTLSConfig `yaml:"mtls,omitempty" json:"mtls,omitempty"`
+	// Profile scopes the rule to a profile name. Set automatically by
+	// expandDefaults from the profile/ruleset containing the rule.
+	Profile  string            `yaml:"profile,omitempty" json:"profile,omitempty"`
+	Device   string            `hcl:"device,optional" yaml:"device,omitempty" json:"device,omitempty"`
+	Host     string            `hcl:"host" yaml:"host" json:"host"`
+	Port     int               `hcl:"port,optional" yaml:"port,omitempty" json:"port,omitempty"`
+	Action   string            `hcl:"action,optional" yaml:"action,omitempty" json:"action,omitempty"` // "" | "deny"
+	Reason   string            `hcl:"reason,optional" yaml:"reason,omitempty" json:"reason,omitempty"`
+	Headers  map[string]string `hcl:"headers,optional" yaml:"headers,omitempty" json:"headers,omitempty"`
+	Body     bool              `hcl:"body,optional" yaml:"body,omitempty" json:"body,omitempty"`
+	Upstream string            `hcl:"upstream,optional" yaml:"upstream,omitempty" json:"upstream,omitempty"`
+	Auth     string            `hcl:"auth,optional" yaml:"auth,omitempty" json:"auth,omitempty"`
+	// Approve gates the request on HITL approval. Names must resolve
+	// to declared Approvers (or "dashboard", always-available). Empty
+	// or absent = pass-through (no HITL).
+	Approve []string    `hcl:"approve,optional" yaml:"approve,omitempty" json:"approve,omitempty"`
+	Match   *Match      `hcl:"match,block" yaml:"match,omitempty" json:"match,omitempty"`
+	Swap    []Swap      `hcl:"swap,block" yaml:"swap,omitempty" json:"swap,omitempty"`
+	MTLS    *MTLSConfig `hcl:"mtls,block" yaml:"mtls,omitempty" json:"mtls,omitempty"`
 }
 
 type MTLSConfig struct {
-	CA   string `yaml:"ca" json:"ca"`     // path to PEM (optional — pinning upstream cert)
-	Cert string `yaml:"cert" json:"cert"` // path to client cert PEM
-	Key  string `yaml:"key" json:"key"`   // path to client key PEM
+	CA   string `hcl:"ca,optional" yaml:"ca" json:"ca"`
+	Cert string `hcl:"cert" yaml:"cert" json:"cert"`
+	Key  string `hcl:"key" yaml:"key" json:"key"`
 }
 
 type Swap struct {
-	Placeholder string `yaml:"placeholder" json:"placeholder"`
-	Secret      string `yaml:"secret" json:"secret"`
+	Placeholder string `hcl:"placeholder" yaml:"placeholder" json:"placeholder"`
+	Secret      string `hcl:"secret" yaml:"secret" json:"secret"`
 }
 
 func loadConfig(path string) (*Config, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
+	var c Config
+	if err := hclsimple.DecodeFile(path, nil, &c); err != nil {
 		return nil, err
 	}
-	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
-		return nil, err
+	if c.Tailscale == nil {
+		c.Tailscale = &Tailscale{}
 	}
 	if c.Listen == "" {
 		c.Listen = ":443"
 	}
 	return &c, nil
+}
+
+// writeConfigHCL re-emits the gateway config as HCL at path. Used by
+// the dashboard rule editor — loses comments but keeps the file as the
+// single source of truth (no rules.yaml sidecar). Atomic via temp +
+// rename so a crashed write doesn't corrupt the live config.
+func writeConfigHCL(c *Config, path string) error {
+	f := hclwrite.NewEmptyFile()
+	body := f.Body()
+	setStr := func(name, v string) {
+		if v != "" {
+			body.SetAttributeValue(name, cty.StringVal(v))
+		}
+	}
+	setStr("listen", c.Listen)
+	setStr("info_listen", c.InfoListen)
+	setStr("public_url", c.PublicURL)
+	setStr("admin_email", c.AdminEmail)
+	setStr("ca_dir", c.CADir)
+	setStr("log_path", c.LogPath)
+	setStr("oauth_dir", c.OAuthDir)
+	setStr("resolver", c.Resolver)
+	if c.Tailscale != nil && (c.Tailscale.Control != "" || c.Tailscale.WGEndpoint != "") {
+		body.AppendNewline()
+		ts := body.AppendNewBlock("tailscale", nil).Body()
+		if c.Tailscale.Control != "" {
+			ts.SetAttributeValue("control", cty.StringVal(c.Tailscale.Control))
+		}
+		if c.Tailscale.WGEndpoint != "" {
+			ts.SetAttributeValue("wg_endpoint", cty.StringVal(c.Tailscale.WGEndpoint))
+		}
+		if c.Tailscale.WGSubnetCIDR != "" {
+			ts.SetAttributeValue("wg_subnet_cidr", cty.StringVal(c.Tailscale.WGSubnetCIDR))
+		}
+		if c.Tailscale.WGInterface != "" {
+			ts.SetAttributeValue("wg_interface", cty.StringVal(c.Tailscale.WGInterface))
+		}
+	}
+	// Group rules back into their profile blocks. Custom (operator-
+	// declared) rules persist; default-host rules are dropped because
+	// expandDefaults regenerates them from each profile's integration
+	// list on every load. Rules whose content matches a top-level
+	// ruleset block are also skipped — they came from the ruleset
+	// during expand and re-emitting them inline would duplicate.
+	rulesetContent := map[string]bool{}
+	for _, rs := range c.Rulesets {
+		for _, r := range rs.Rules {
+			rulesetContent[ruleContentKey(r)] = true
+		}
+	}
+	customByProfile := map[string][]Rule{}
+	for _, r := range c.Rules {
+		if isDefaultRule(r) {
+			continue
+		}
+		if rulesetContent[ruleContentKey(r)] {
+			continue
+		}
+		customByProfile[r.Profile] = append(customByProfile[r.Profile], r)
+	}
+	for _, a := range c.Approvers {
+		body.AppendNewline()
+		ab := body.AppendNewBlock("approver", []string{a.Name}).Body()
+		ab.SetAttributeValue("type", cty.StringVal(a.Type))
+		if a.Channel != "" {
+			ab.SetAttributeValue("channel", cty.StringVal(a.Channel))
+		}
+		if a.Timeout != 0 {
+			ab.SetAttributeValue("timeout", cty.NumberIntVal(int64(a.Timeout)))
+		}
+		if a.Model != "" {
+			ab.SetAttributeValue("model", cty.StringVal(a.Model))
+		}
+		if a.Policy != "" {
+			ab.SetAttributeValue("policy", cty.StringVal(a.Policy))
+		}
+	}
+	for _, rs := range c.Rulesets {
+		body.AppendNewline()
+		rsb := body.AppendNewBlock("ruleset", []string{rs.Name}).Body()
+		for _, r := range rs.Rules {
+			writeRuleHCL(rsb, r)
+		}
+	}
+	for _, p := range c.Profiles {
+		body.AppendNewline()
+		pb := body.AppendNewBlock("profile", []string{p.Name}).Body()
+		if len(p.IntegrationNames) > 0 {
+			vs := make([]cty.Value, len(p.IntegrationNames))
+			for i, n := range p.IntegrationNames {
+				vs[i] = cty.StringVal(n)
+			}
+			pb.SetAttributeValue("integrations", cty.ListVal(vs))
+		}
+		if len(p.RulesetRefs) > 0 {
+			vs := make([]cty.Value, len(p.RulesetRefs))
+			for i, n := range p.RulesetRefs {
+				vs[i] = cty.StringVal(n)
+			}
+			pb.SetAttributeValue("rules", cty.ListVal(vs))
+		}
+		for _, r := range customByProfile[p.Name] {
+			writeRuleHCL(pb, r)
+		}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, f.Bytes(), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// ruleContentKey returns a stable serialization of a rule's content
+// (excluding Profile, which is set by expandDefaults from its enclosing
+// block). Used by writeConfigHCL to detect rules that came from a
+// referenced ruleset and avoid double-emitting them inline.
+func ruleContentKey(r Rule) string {
+	cp := r
+	cp.Profile = ""
+	b, _ := json.Marshal(cp)
+	return string(b)
+}
+
+// isDefaultRule reports whether r is the shape expandDefaults would
+// re-create for its (profile, integration). Used by writeConfigHCL to
+// avoid serialising auto-derived rules back into the operator's config.
+func isDefaultRule(r Rule) bool {
+	if r.Device != "" || r.Action != "" || r.Reason != "" || r.Body ||
+		r.Upstream != "" || len(r.Approve) > 0 ||
+		len(r.Headers) > 0 || r.Match != nil || len(r.Swap) > 0 || r.MTLS != nil {
+		return false
+	}
+	if r.Auth == "" {
+		return false
+	}
+	def, ok := defaultIntegrations[r.Auth]
+	if !ok {
+		return false
+	}
+	for _, h := range def.Hosts {
+		if h == r.Host {
+			return true
+		}
+	}
+	return false
+}
+
+func writeRuleHCL(parent *hclwrite.Body, r Rule) {
+	rb := parent.AppendNewBlock("rule", nil).Body()
+	if r.Device != "" {
+		rb.SetAttributeValue("device", cty.StringVal(r.Device))
+	}
+	rb.SetAttributeValue("host", cty.StringVal(r.Host))
+	if r.Port != 0 {
+		rb.SetAttributeValue("port", cty.NumberIntVal(int64(r.Port)))
+	}
+	if r.Action != "" {
+		rb.SetAttributeValue("action", cty.StringVal(r.Action))
+	}
+	if r.Reason != "" {
+		rb.SetAttributeValue("reason", cty.StringVal(r.Reason))
+	}
+	if r.Auth != "" {
+		rb.SetAttributeValue("auth", cty.StringVal(r.Auth))
+	}
+	if r.Upstream != "" {
+		rb.SetAttributeValue("upstream", cty.StringVal(r.Upstream))
+	}
+	if r.Body {
+		rb.SetAttributeValue("body", cty.True)
+	}
+	if len(r.Approve) > 0 {
+		vs := make([]cty.Value, len(r.Approve))
+		for i, n := range r.Approve {
+			vs[i] = cty.StringVal(n)
+		}
+		rb.SetAttributeValue("approve", cty.ListVal(vs))
+	}
+	if len(r.Headers) > 0 {
+		vs := map[string]cty.Value{}
+		for k, v := range r.Headers {
+			vs[k] = cty.StringVal(v)
+		}
+		rb.SetAttributeValue("headers", cty.ObjectVal(vs))
+	}
+	if r.Match != nil {
+		mb := rb.AppendNewBlock("match", nil).Body()
+		setStrList := func(name string, xs []string) {
+			if len(xs) == 0 {
+				return
+			}
+			vs := make([]cty.Value, len(xs))
+			for i, s := range xs {
+				vs[i] = cty.StringVal(s)
+			}
+			mb.SetAttributeValue(name, cty.ListVal(vs))
+		}
+		setStrMap := func(name string, m map[string]string) {
+			if len(m) == 0 {
+				return
+			}
+			vs := map[string]cty.Value{}
+			for k, v := range m {
+				vs[k] = cty.StringVal(v)
+			}
+			mb.SetAttributeValue(name, cty.ObjectVal(vs))
+		}
+		setStrListMap := func(name string, m map[string][]string) {
+			if len(m) == 0 {
+				return
+			}
+			vs := map[string]cty.Value{}
+			for k, list := range m {
+				lv := make([]cty.Value, len(list))
+				for i, s := range list {
+					lv[i] = cty.StringVal(s)
+				}
+				if len(lv) == 0 {
+					vs[k] = cty.ListValEmpty(cty.String)
+				} else {
+					vs[k] = cty.ListVal(lv)
+				}
+			}
+			mb.SetAttributeValue(name, cty.ObjectVal(vs))
+		}
+		setStrList("method", r.Match.Method)
+		if r.Match.Path != "" {
+			mb.SetAttributeValue("path", cty.StringVal(r.Match.Path))
+		}
+		setStrListMap("query", r.Match.Query)
+		setStrMap("headers", r.Match.Headers)
+		setStrMap("body_json", r.Match.BodyJSON)
+		if r.Match.BodyContains != "" {
+			mb.SetAttributeValue("body_contains", cty.StringVal(r.Match.BodyContains))
+		}
+		setStrList("resource", r.Match.Resource)
+		setStrList("verb", r.Match.Verb)
+		setStrList("namespace", r.Match.Namespace)
+		setStrList("name", r.Match.Name)
+		setStrMap("params", r.Match.Params)
+		setStrList("sql_verb", r.Match.SQLVerb)
+		setStrList("tables", r.Match.SQLTables)
+		setStrList("function", r.Match.SQLFunction)
+		if r.Match.Statement != "" {
+			mb.SetAttributeValue("statement", cty.StringVal(r.Match.Statement))
+		}
+		if r.Match.StatementRegex != "" {
+			mb.SetAttributeValue("statement_regex", cty.StringVal(r.Match.StatementRegex))
+		}
+		if r.Match.Account != "" {
+			mb.SetAttributeValue("account", cty.StringVal(r.Match.Account))
+		}
+	}
+	for _, s := range r.Swap {
+		sb := rb.AppendNewBlock("swap", nil).Body()
+		sb.SetAttributeValue("placeholder", cty.StringVal(s.Placeholder))
+		sb.SetAttributeValue("secret", cty.StringVal(s.Secret))
+	}
+	if r.MTLS != nil {
+		mb := rb.AppendNewBlock("mtls", nil).Body()
+		if r.MTLS.CA != "" {
+			mb.SetAttributeValue("ca", cty.StringVal(r.MTLS.CA))
+		}
+		mb.SetAttributeValue("cert", cty.StringVal(r.MTLS.Cert))
+		mb.SetAttributeValue("key", cty.StringVal(r.MTLS.Key))
+	}
 }
 
 func (r *Rule) matches(host string) bool {
@@ -289,7 +608,8 @@ func newUpstreamDialer(resolver string) *net.Dialer {
 
 type Gateway struct {
 	cfg     *Config
-	rules   []Rule
+	cfgPath string                 // path the HCL config was loaded from; dashboard writes back here
+	rules   atomic.Pointer[[]Rule] // hot-swappable on config-file change
 	certs   *CertCache
 	dialer  *net.Dialer
 	sink    *Sink
@@ -297,6 +617,81 @@ type Gateway struct {
 	agents  *AgentRegistry
 	hitl    *HITLRegistry
 	onboard *onboardRegistry
+}
+
+// Rules returns the current snapshot of rules. Cheap (atomic load).
+// Callers MUST NOT mutate the returned slice — copy first if editing.
+func (g *Gateway) Rules() []Rule {
+	if p := g.rules.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// approveTimeout picks the smallest non-zero timeout from the named
+// approvers. Returns 0 (HITLRegistry will default to 60s) when no
+// approver declares one.
+func approveTimeout(approvers []Approver, names []string) time.Duration {
+	min := 0
+	for _, n := range names {
+		for _, a := range approvers {
+			if a.Name == n && a.Timeout > 0 && (min == 0 || a.Timeout < min) {
+				min = a.Timeout
+			}
+		}
+	}
+	return time.Duration(min) * time.Second
+}
+
+// profileFor returns the profile name to use when applying rules /
+// looking up OAuth credentials for a given peer IP. Falls back to the
+// first declared profile in the config when the peer hasn't been
+// assigned (single-tenant default).
+func (g *Gateway) profileFor(peerIP string) string {
+	if g.onboard != nil {
+		if p := g.onboard.ProfileForIP(peerIP); p != "" {
+			return p
+		}
+	}
+	if len(g.cfg.Profiles) > 0 {
+		return g.cfg.Profiles[0].Name
+	}
+	return ""
+}
+
+// watchConfig polls the config file's mtime every 3s. On change it
+// re-decodes the HCL and atomically swaps in the new rules + admin_email
+// + integrations list. Listen ports / CA dir / OAuth dir / Tailscale
+// block changes still require a restart (logged but not applied).
+func (g *Gateway) watchConfig(path string) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	last := st.ModTime()
+	for {
+		time.Sleep(3 * time.Second)
+		st, err := os.Stat(path)
+		if err != nil || !st.ModTime().After(last) {
+			continue
+		}
+		last = st.ModTime()
+		next, err := loadConfig(path)
+		if err != nil {
+			log.Printf("config reload: %v", err)
+			continue
+		}
+		if err := expandDefaults(next); err != nil {
+			log.Printf("config reload: expand defaults: %v", err)
+			continue
+		}
+		newRules := append([]Rule(nil), next.Rules...)
+		g.rules.Store(&newRules)
+		g.cfg.Rules = next.Rules
+		g.cfg.AdminEmail = next.AdminEmail
+		g.cfg.Profiles = next.Profiles
+		log.Printf("config reloaded: %d rules across %d profile(s)", len(newRules), len(next.Profiles))
+	}
 }
 
 // trackCodexWSUsage parses a single WebSocket text-frame payload from
@@ -408,6 +803,21 @@ func joinUserContent(c json.RawMessage) string {
 // title shows the actual user prompt.
 func stripCodexWrappers(s string) string {
 	return stripXMLBlocks(s, "environment_context", "user_instructions")
+}
+
+// trackKindFor returns the usage-parsing flavor for a given host (and,
+// for chatgpt.com, also gates HTTP-mode codex tracking). Tracking is
+// always-on; operators don't configure it per rule.
+func trackKindFor(host string) string {
+	switch host {
+	case "api.anthropic.com":
+		return "claude_usage"
+	case "api.openai.com":
+		return "openai_usage"
+	case "chatgpt.com":
+		return "codex_ws_usage"
+	}
+	return ""
 }
 
 // trackLLMUsage parses LLM API request/response bodies for session id,
@@ -825,7 +1235,8 @@ func (g *Gateway) handle(raw net.Conn) {
 	}
 	c := wrapPeek(raw, prefix)
 	log.Printf("sni-peek: %s", host)
-	hostRule := selectHostRule(g.rules, host, peerIP(c))
+	pip := peerIP(c)
+	hostRule := selectHostRule(g.Rules(), host, pip, g.profileFor(pip))
 	if hostRule == nil {
 		g.splice(c, host)
 		return
@@ -846,10 +1257,11 @@ func (g *Gateway) splice(c net.Conn, host string) {
 		return
 	}
 	defer up.Close()
+	agentAddr := peerIP(c) // capture BEFORE pipe — RemoteAddr() goes nil once netstack closes the conn
 	in, out := pipe(c, up)
-	g.sink.Emit(Event{Mode: "splice", Host: host, AgentIP: peerIP(c), Action: "allow", In: in, Out: out, Ms: time.Since(start).Milliseconds()})
-	if g.agents != nil {
-		g.agents.track(c.RemoteAddr().String(), host, in, out)
+	g.sink.Emit(Event{Mode: "splice", Host: host, AgentIP: agentAddr, Action: "allow", In: in, Out: out, Ms: time.Since(start).Milliseconds()})
+	if g.agents != nil && agentAddr != "" {
+		g.agents.track(agentAddr, host, in, out)
 	}
 }
 
@@ -880,6 +1292,7 @@ func pipe(a, b net.Conn) (rx, tx int64) {
 }
 
 func (g *Gateway) mitm(c net.Conn, host string, defaultRule *Rule) {
+	agentAddr := peerIP(c) // capture BEFORE the connection enters mid-flight states; netstack RemoteAddr can race to nil on close.
 	cert, err := g.certs.mint(host)
 	if err != nil {
 		log.Printf("mint %s: %v", host, err)
@@ -927,7 +1340,25 @@ func (g *Gateway) mitm(c net.Conn, host string, defaultRule *Rule) {
 		tc.SetReadDeadline(time.Time{})
 
 		start := time.Now()
-		rule := selectRequestRule(g.rules, host, peerIP(c), req)
+		pip := peerIP(c)
+		profile := g.profileFor(pip)
+		rules := g.Rules()
+		// If any candidate rule uses body_json, pre-read the body
+		// once and re-attach so downstream consumers (Track / Swap /
+		// the upstream RoundTrip) still see it.
+		var matchBody []byte
+		if rulesNeedBody(rules, host, pip, profile) && req.Body != nil {
+			b, err := io.ReadAll(io.LimitReader(req.Body, 1<<20))
+			req.Body.Close()
+			if err == nil {
+				matchBody = b
+				req.Body = io.NopCloser(bytes.NewReader(b))
+				if req.ContentLength > 0 {
+					req.ContentLength = int64(len(b))
+				}
+			}
+		}
+		rule := selectRequestRule(rules, host, pip, profile, req, matchBody)
 		// If the host-level default rule has a Match that didn't fire for
 		// this request (e.g. method:[POST] and request is GET), don't
 		// fall back to it — a GET shouldn't inherit a POST-only deny.
@@ -945,16 +1376,20 @@ func (g *Gateway) mitm(c net.Conn, host string, defaultRule *Rule) {
 			Method: req.Method, Path: req.URL.Path,
 			AgentIP: peerIP(c),
 		}
-		if rule.Action == "hitl" {
+		if len(rule.Approve) > 0 {
 			pending := &HITLPending{
-				AgentIP: peerIP(c),
-				Host:    host,
-				Method:  req.Method,
-				Path:    req.URL.Path,
-				UA:      req.Header.Get("User-Agent"),
-				Reason:  rule.Reason,
+				AgentIP:   peerIP(c),
+				Host:      host,
+				Method:    req.Method,
+				Path:      req.URL.Path,
+				UA:        req.Header.Get("User-Agent"),
+				Reason:    rule.Reason,
+				Approvers: rule.Approve,
 			}
-			timeout := time.Duration(rule.HITLTimeout) * time.Second
+			// Per-approver timeouts: minimum of any named approver's
+			// timeout (most-restrictive wins). Dashboard contributes
+			// no timeout (always 60s default).
+			timeout := approveTimeout(g.cfg.Approvers, rule.Approve)
 			d := g.hitl.Wait(req.Context(), pending, timeout)
 			if !d.Allow {
 				reason := d.Reason
@@ -1020,12 +1455,13 @@ func (g *Gateway) mitm(c net.Conn, host string, defaultRule *Rule) {
 			}
 		}
 		injectHeaders(req.Header, rule)
-		if isWSUpgrade(req) && rule.WSScan {
+		if isWSUpgrade(req) {
 			g.handleWSUpgrade(tc, br, req, rule, upstream)
 			return
 		}
+		trackKind := trackKindFor(host)
 		var trackedReqBody []byte
-		if rule.Track != "" && req.Body != nil {
+		if trackKind != "" && req.Body != nil {
 			b, _ := io.ReadAll(io.LimitReader(req.Body, 1<<20))
 			req.Body.Close()
 			trackedReqBody = b
@@ -1076,7 +1512,7 @@ func (g *Gateway) mitm(c net.Conn, host string, defaultRule *Rule) {
 			return
 		}
 		var trackBuf *bytes.Buffer
-		if rule.Track != "" && resp.StatusCode == 200 {
+		if trackKind != "" && resp.StatusCode == 200 {
 			ct := resp.Header.Get("Content-Type")
 			if strings.Contains(ct, "json") || strings.Contains(ct, "event-stream") {
 				trackBuf = &bytes.Buffer{}
@@ -1097,7 +1533,7 @@ func (g *Gateway) mitm(c net.Conn, host string, defaultRule *Rule) {
 					zr.Close()
 				}
 			}
-			g.trackLLMUsage(c, rule.Track, req.URL.Path, trackedReqBody, body)
+			g.trackLLMUsage(c, trackKind, req.URL.Path, trackedReqBody, body)
 		}
 
 		ev.Status = resp.StatusCode
@@ -1110,8 +1546,8 @@ func (g *Gateway) mitm(c net.Conn, host string, defaultRule *Rule) {
 		ev.RespSample = respS.sample()
 		ev.Ms = time.Since(start).Milliseconds()
 		g.sink.Emit(ev)
-		if g.agents != nil {
-			g.agents.trackUA(c.RemoteAddr().String(), host, req.UserAgent(), reqS.n, respS.n)
+		if g.agents != nil && agentAddr != "" {
+			g.agents.trackUA(agentAddr, host, req.UserAgent(), reqS.n, respS.n)
 		}
 
 		if writeErr != nil {
@@ -1150,9 +1586,16 @@ func main() {
 }
 
 func peerIP(c net.Conn) string {
-	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if c == nil {
+		return ""
+	}
+	addr := c.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		return c.RemoteAddr().String()
+		return addr.String()
 	}
 	return host
 }
@@ -1199,16 +1642,6 @@ func runGateway(args []string) {
 	if err := expandDefaults(cfg); err != nil {
 		log.Fatalf("expand defaults: %v", err)
 	}
-	// runtime override (from dashboard rule edits) wins over config file
-	overrideFile := rulesOverrideFile(cfg)
-	if b, err := os.ReadFile(overrideFile); err == nil {
-		var override []Rule
-		if err := yaml.Unmarshal(b, &override); err == nil {
-			cfg.Rules = override
-			log.Printf("loaded rule override (%d rules) from %s", len(override), overrideFile)
-		}
-	}
-	rules := cfg.Rules
 	certs, err := loadCA(cfg.CADir)
 	if err != nil {
 		log.Fatalf("ca: %v", err)
@@ -1227,7 +1660,7 @@ func runGateway(args []string) {
 	}
 	g := &Gateway{
 		cfg:     cfg,
-		rules:   rules,
+		cfgPath: *cfgPath,
 		certs:   certs,
 		dialer:  newUpstreamDialer(cfg.Resolver),
 		sink:    sink,
@@ -1236,12 +1669,17 @@ func runGateway(args []string) {
 		hitl:    newHITLRegistry(),
 		onboard: newOnboardRegistry(),
 	}
+	rules := append([]Rule(nil), cfg.Rules...)
+	g.rules.Store(&rules)
+	go g.watchConfig(*cfgPath)
 	g.onboard.Load(cfg.OAuthDir)
+	g.agents.onboard = g.onboard
+
 	// always-on built-in HITL notifier: fan-out to dashboard SSE.
 	g.hitl.Register(&hitlSinkNotifier{sink: g.sink})
 
 	if cfg.InfoListen != "" {
-		mux := newWebMux(g, cfg.CADir, cfg.Tailscale, cfg.PublicURL)
+		mux := newWebMux(g, cfg.CADir, *cfg.Tailscale, cfg.PublicURL)
 		go func() {
 			http.ListenAndServe(cfg.InfoListen, mux)
 		}()
@@ -1260,17 +1698,20 @@ func runGateway(args []string) {
 	// No /etc/hosts hack needed on clients — agents resolve real
 	// hostnames via public DNS and the gateway intercepts at L3.
 	if strings.EqualFold(cfg.Tailscale.Control, "wireguard") {
-		wg, err := StartWGServer(cfg.Tailscale, oauthDir)
+		wg, err := StartWGServer(*cfg.Tailscale, oauthDir)
 		if err != nil {
 			log.Fatalf("wireguard: %v", err)
 		}
 		setWGServer(wg)
-		dashMux := newWebMux(g, cfg.CADir, cfg.Tailscale, cfg.PublicURL)
+		dashMux := newWebMux(g, cfg.CADir, *cfg.Tailscale, cfg.PublicURL)
 		dashPort := portOf(cfg.InfoListen)
 		if err := wg.EnablePromiscuousForwarder(func(c net.Conn, dstIP string, dstPort uint16) {
+			log.Printf("wg-fwd: %s:%d", dstIP, dstPort)
 			switch {
 			case dstPort == 443:
 				g.handle(c)
+			case dstPort == 5432:
+				g.handlePostgres(c, dstIP)
 			case dashPort != 0 && int(dstPort) == dashPort:
 				_ = http.Serve(&oneShotListener{c: c}, dashMux)
 			default:
@@ -1279,14 +1720,14 @@ func runGateway(args []string) {
 		}); err != nil {
 			log.Fatalf("wireguard forwarder: %v", err)
 		}
-		log.Printf("wireguard promiscuous forwarder ready (any dst → :443=mitm, :%d=dash, else=relay)", dashPort)
+		log.Printf("wireguard promiscuous forwarder ready (any dst → :443=mitm, :5432=pg, :%d=dash, else=relay)", dashPort)
 	}
 
 	ln, err := openListener(cfg)
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("gateway listening on %s, %d rules", ln.Addr(), len(cfg.Rules))
+	log.Printf("gateway listening on %s, %d rules", ln.Addr(), len(g.Rules()))
 
 	for {
 		c, err := ln.Accept()

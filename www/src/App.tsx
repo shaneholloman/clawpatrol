@@ -5,6 +5,7 @@ import { DevicePage } from "./components/DevicePage";
 import { LiveRequests } from "./components/LiveRequests";
 import { OnboardPage } from "./components/OnboardPage";
 import { AddDeviceModal } from "./components/AddDeviceModal";
+import { SettingsModal } from "./components/SettingsModal";
 import { HITLBar } from "./components/HITLBar";
 import { getStatus, getAgents, getWhoami, type Integration, type Agent, type Whoami } from "./lib/api";
 
@@ -22,6 +23,7 @@ export default function App() {
   const [whoami, setWhoami] = useState<Whoami | null>(null);
   const [connectId, setConnectId] = useState<string | null>(null);
   const [showAddDevice, setShowAddDevice] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
   const [route, setRoute] = useState(parseRoute());
 
   useEffect(() => {
@@ -67,6 +69,16 @@ export default function App() {
             >
               +
             </button>
+            <button
+              onClick={() => setShowSettings(true)}
+              className="w-[36px] h-[36px] rounded-full border border-[#e5e5e5] text-[#525252] flex items-center justify-center hover:border-[#171717] hover:text-[#171717] transition-colors"
+              title="settings (gateway.hcl)"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
           </div>
           <section className="bg-white border border-[#e5e5e5] rounded overflow-hidden">
             <div className="overflow-x-auto">
@@ -90,6 +102,7 @@ export default function App() {
         />
       )}
       {showAddDevice && <AddDeviceModal publicURL={whoami?.public_url} onClose={() => setShowAddDevice(false)} />}
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} onSaved={refresh} />}
       {connectId && (
         <ConnectModal
           id={connectId}

@@ -5,7 +5,7 @@ import { RulesEditor } from "./RulesEditor";
 // scope=undefined → global rules. scope=ip → per-device rules layered
 // on top of global ones (shown together in the table; only device rules
 // are editable here).
-export function RulesPanel({ deviceIP }: { deviceIP?: string }) {
+export function RulesPanel({ deviceIP, profile }: { deviceIP?: string; profile?: string }) {
   const [globalRules, setGlobalRules] = useState<RuleSummary[]>([]);
   const [deviceRules, setDeviceRules] = useState<RuleSummary[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -24,8 +24,15 @@ export function RulesPanel({ deviceIP }: { deviceIP?: string }) {
   useEffect(() => {
     reload();
   }, [deviceIP]);
+  // On a device page only show rules that apply to this device:
+  // device-scoped rules + global rules whose profile is empty (catch-all)
+  // or matches the device's assigned profile. Otherwise rules from
+  // sibling profiles render as duplicate-looking rows.
+  const inheritedFromGlobal = (globalRules ?? []).filter(
+    (r) => !r.device && (!r.profile || !profile || r.profile === profile),
+  );
   const rules = deviceIP
-    ? [...(deviceRules ?? []), ...(globalRules ?? []).filter((r) => !r.device)]
+    ? [...(deviceRules ?? []), ...inheritedFromGlobal]
     : (globalRules ?? []);
 
   return (

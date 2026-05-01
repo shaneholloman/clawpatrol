@@ -83,13 +83,14 @@ CONTROL="${CONTROL:-tailscale}"
 
 case "$CONTROL" in
   tailscale)
-    TS_BLOCK=$(cat <<YAML
-tailscale:
-  control: tailscale
-  oauth_client_id: "{{secret:TS_OAUTH_CLIENT_ID}}"
-  oauth_client_secret: "{{secret:TS_OAUTH_CLIENT_SECRET}}"
-  tags: ["tag:client"]
-YAML
+    TS_BLOCK=$(cat <<HCL
+tailscale {
+  control             = "tailscale"
+  oauth_client_id     = "{{secret:TS_OAUTH_CLIENT_ID}}"
+  oauth_client_secret = "{{secret:TS_OAUTH_CLIENT_SECRET}}"
+  tags                = ["tag:client"]
+}
+HCL
 )
     ;;
   wireguard)
@@ -105,12 +106,13 @@ YAML
     remote "iptables -C INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null \
             || iptables -I INPUT -p udp --dport ${WG_PORT} -j ACCEPT"
 
-    TS_BLOCK=$(cat <<YAML
-tailscale:
-  control: wireguard
-  wg_endpoint: "${WG_ENDPOINT}"
-  wg_subnet_cidr: "${WG_SUBNET_CIDR}"
-YAML
+    TS_BLOCK=$(cat <<HCL
+tailscale {
+  control        = "wireguard"
+  wg_endpoint    = "${WG_ENDPOINT}"
+  wg_subnet_cidr = "${WG_SUBNET_CIDR}"
+}
+HCL
 )
     ;;
   *)
@@ -119,24 +121,16 @@ YAML
     ;;
 esac
 
-cat > dist/gateway.yaml <<EOF
-listen: "0.0.0.0:${PORT}"
-info_listen: "0.0.0.0:8080"
-public_url: "${PUBLIC_URL}"
-ca_dir: "${REMOTE_DIR}/ca"
-log_path: "${REMOTE_DIR}/gateway.log"
-oauth_dir: "${REMOTE_DIR}/oauth"
-
-integrations:
-  - claude
-  - codex
-  - github
+cat > dist/gateway.hcl <<EOF
+listen       = "0.0.0.0:${PORT}"
+info_listen  = "0.0.0.0:8080"
+public_url   = "${PUBLIC_URL}"
+ca_dir       = "${REMOTE_DIR}/ca"
+log_path     = "${REMOTE_DIR}/gateway.log"
+oauth_dir    = "${REMOTE_DIR}/oauth"
+integrations = ["claude", "codex", "github"]
 
 ${TS_BLOCK}
-
-# No default global rules. Operators add company-wide policy here, or
-# users add per-device rules via the dashboard.
-rules: []
 EOF
 
 cat > dist/remote-modules.sh <<'EOSSH'
@@ -260,7 +254,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${REMOTE_DIR}
 EnvironmentFile=-${REMOTE_DIR}/secrets.env
-ExecStart=${REMOTE_DIR}/gateway gateway -config ${REMOTE_DIR}/gateway.yaml
+ExecStart=${REMOTE_DIR}/gateway gateway -config ${REMOTE_DIR}/gateway.hcl
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65536
@@ -277,7 +271,7 @@ ship_if_changed dist/gateway-linux-amd64 "${REMOTE_DIR}/gateway"
 remote "chmod +x ${REMOTE_DIR}/gateway"
 ship_if_changed ca/ca.crt "${REMOTE_DIR}/ca/ca.crt"
 ship_if_changed ca/ca.key "${REMOTE_DIR}/ca/ca.key"
-ship_if_changed dist/gateway.yaml "${REMOTE_DIR}/gateway.yaml"
+ship_if_changed dist/gateway.hcl "${REMOTE_DIR}/gateway.hcl"
 ship_if_changed dist/remote-modules.sh "${REMOTE_DIR}/remote-modules.sh"
 ship_if_changed dist/remote-nft.sh "${REMOTE_DIR}/remote-nft.sh"
 ship_if_changed dist/remote-up.sh "${REMOTE_DIR}/remote-up.sh"
