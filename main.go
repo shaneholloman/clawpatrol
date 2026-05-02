@@ -69,6 +69,14 @@ type Config struct {
 	// TopRules.
 	Rules []Rule
 	OAuth []OAuthIntegration
+
+	// HostIntegration maps a hostname to the integration name whose
+	// credential should be injected when the gateway MITMs that host.
+	// Populated by expandDefaults from each profile's `integrations`
+	// list. Not decoded from HCL, not surfaced in /api/rules — kept
+	// invisible to the rules table since they're not policy decisions
+	// but auth-injection wiring.
+	HostIntegration map[string]string
 }
 
 // Profile binds integrations + rulesets + inline rules. Each onboarded
@@ -1419,13 +1427,20 @@ func truncate(s string, n int) string {
 	return s
 }
 
-// ownerForRequest returns the user-scoped credential-owner key for a
-// peer. Falls back to peer IP when whois unavailable. For tagged
-// (onboarded) devices, the override populated by /api/onboard/claim
-// resolves the IP to the human approver — without it, Tailscale OAuth
-// only reports "tagged-devices" and per-user credential lookups miss.
+// ownerForRequest returns the credential-bucket key for a peer. With
+// the profile-as-tenant model, that's the device's assigned profile
+// name (devices.profile). Falls back to the peer's onboard-mapped
+// owner email and finally peer IP for un-onboarded clients — both
+// preserve compatibility with credentials saved before the profile
+// migration. Whois lookup remains in place for tailscale-control mode
+// where the dashboard still binds creds to the human's login.
 func (g *Gateway) ownerForRequest(c net.Conn, _ *OAuthIntegration) string {
 	ip := peerIP(c)
+	if g.onboard != nil {
+		if profile := g.onboard.ProfileForIP(ip); profile != "" {
+			return profile
+		}
+	}
 	login := ""
 	if g.agents != nil && g.agents.lc != nil {
 		if who := g.agents.lookupWhois(ip); who != nil && !who.UserProfile.IsZero() {
@@ -1455,8 +1470,16 @@ func (g *Gateway) handle(raw net.Conn) {
 	pip := peerIP(c)
 	hostRule := selectHostRule(g.Rules(), host, pip, g.profileFor(pip))
 	if hostRule == nil {
-		g.splice(c, host)
-		return
+		// No user rule for this host. If it's an integration host,
+		// synthesize a transient Rule so MITM still injects the right
+		// credential. Otherwise pass-through (default-allow with no
+		// inspection).
+		if integ := g.cfg.HostIntegration[host]; integ != "" {
+			hostRule = &Rule{Host: host, Auth: integ}
+		} else {
+			g.splice(c, host)
+			return
+		}
 	}
 	if hostRule.Match == nil && hostRule.Action == "deny" {
 		log.Printf("deny %s: %s", host, hostRule.Reason)
