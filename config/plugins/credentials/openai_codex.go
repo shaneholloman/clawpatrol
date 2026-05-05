@@ -66,14 +66,18 @@ func chatgptAccountID(jwt string) string {
 
 // EnvVars intentionally returns nothing.
 //
-// Pushing OPENAI_API_KEY flips codex out of subscription/OAuth mode
-// into API-key mode, which uses a different request shape — it sends
-// GET to chatgpt.com/backend-api/codex/responses, server replies 405
-// (POST only). Subscription mode reads ~/.codex/auth.json for the
-// real JWT and POSTs correctly. Until we ship the agent-shim that
-// writes a placeholder auth.json (matching unclaw), the cleanest
-// path is to leave OPENAI_API_KEY unset and let codex pick up the
-// real auth.json.
+// Codex env-var push-down lives on the openai_codex_https endpoint
+// plugin (config/plugins/endpoints/openai_codex_https.go). Pushing it
+// from the credential would attach the synthetic JWT to every
+// endpoint that binds this credential — including api.openai.com,
+// where it has no business going. Operators wire codex via:
+//
+//	credential "openai_codex_oauth" "codex" {}
+//
+//	endpoint "openai_codex_https" "codex" {
+//	  hosts      = ["chatgpt.com"]
+//	  credential = codex
+//	}
 func (*OpenAICodexOAuth) EnvVars() []config.EnvVar { return nil }
 
 func (a *OpenAICodexOAuth) OAuthFlow() *config.OAuthIntegration {

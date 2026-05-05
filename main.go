@@ -1384,6 +1384,28 @@ func (g *Gateway) mitmHTTPS(c net.Conn, host string, ep *config.CompiledEndpoint
 			}
 		}
 
+		// Endpoint-level synthetic-response hook. The endpoint
+		// plugin's runtime can short-circuit specific paths and
+		// return a clawpatrol-generated response without forwarding
+		// upstream — used by openai_codex_https to serve the JWKS +
+		// agent-task-register stubs that anchor codex's Agent
+		// Identity flow on hosts we MITM. Endpoints without a
+		// responder (the default https plugin) fall through.
+		if responder, ok := ep.Plugin.Runtime.(runtime.HTTPSyntheticResponder); ok {
+			if r, handled, err := responder.RespondHTTP(req.Context(), req); err != nil {
+				log.Printf("respond %s: %v", ep.Name, err)
+			} else if handled {
+				ev.Status = r.StatusCode
+				ev.Action = "synth"
+				if err := r.Write(tc); err != nil {
+					log.Printf("synth write %s %s: %v", host, req.URL.Path, err)
+				}
+				ev.Ms = time.Since(start).Milliseconds()
+				g.emitEnd(ev)
+				continue
+			}
+		}
+
 		// Credential injection. Pick the credential entry that
 		// applies to this request (singular binding short-circuits;
 		// multi-credential dispatch asks the endpoint plugin's

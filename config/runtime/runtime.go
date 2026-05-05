@@ -30,6 +30,27 @@ type HTTPCredentialRuntime interface {
 	InjectHTTP(ctx context.Context, req *http.Request, sec Secret) error
 }
 
+// HTTPSyntheticResponder is the optional contract an endpoint
+// plugin's runtime implements when it needs to short-circuit certain
+// matched requests and return a synthetic response without forwarding
+// upstream. The openai_codex_https endpoint uses it to serve a
+// clawpatrol-controlled JWKS at chatgpt.com's agent-identity URL (so
+// a JWT we minted ourselves validates) and to stub out the agent-task
+// registration POST.
+//
+// RespondHTTP is called by mitmHTTPS before credential injection.
+// Returning (resp, true, nil) writes resp to the agent and skips
+// forwarding; returning (_, false, nil) falls through to the normal
+// inject + proxy path. Errors are logged and the request still
+// forwards verbatim.
+//
+// The hook lives on the endpoint plugin (not the credential) so the
+// behavior is bound to the protocol surface, not to whichever bearer
+// happens to be configured for it.
+type HTTPSyntheticResponder interface {
+	RespondHTTP(ctx context.Context, req *http.Request) (*http.Response, bool, error)
+}
+
 // PostgresCredentialRuntime swaps the agent's StartupMessage password
 // for the real one before the upstream connect. The wire-protocol
 // front-end calls this once per session.
