@@ -108,6 +108,13 @@ func postJoinSetup(gateway, caDir string, skipTrust bool) (joinSetup, error) {
 	if err := fetchCAHTTP(gateway, s.caPath); err != nil {
 		return s, fmt.Errorf("fetch CA: %w", err)
 	}
+	// Persist the dashboard URL so subsequent `clawpatrol env` /
+	// `clawpatrol run` invocations can fetch the env push-down list
+	// from the gateway instead of iterating compiled-in plugins.
+	// Best-effort; the read side falls back to local enumeration
+	// when this file is missing.
+	_ = os.WriteFile(filepath.Join(caDir, "gateway"),
+		[]byte(strings.TrimRight(gateway, "/")+"\n"), 0o644)
 	if !skipTrust {
 		if err := installCATrust(s.caPath); err != nil {
 			s.caHint = manualTrustHint(s.caPath)
@@ -619,7 +626,7 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 	}
 	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
 	stopSpin := startSpinner("Waiting for approval")
-	authKey, loginServer := "", ""
+	authKey, loginServer, apiToken := "", "", ""
 	for time.Now().Before(deadline) {
 		time.Sleep(interval)
 		pr, err := cli.Post(gateway+"/api/onboard/poll?device_code="+start.DeviceCode, "application/json", nil)
@@ -632,6 +639,7 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		if k, ok := pv["auth_key"]; ok && k != "" {
 			authKey = k
 			loginServer = pv["login_server"]
+			apiToken = pv["api_token"]
 			break
 		}
 		if e := pv["error"]; e != "" && e != "authorization_pending" && e != "slow_down" {
@@ -644,6 +652,15 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		return false, fmt.Errorf("timed out waiting for approval")
 	}
 	fmt.Println("Approved.")
+	// Persist the per-peer bearer the gateway minted alongside the
+	// wg conf. Lives next to ca.crt — same dir the env-pushdown
+	// fetcher reads. Best-effort; missing file means env-pushdown
+	// will refuse to authenticate and the operator gets a clear
+	// stderr warning instead of a silent fall-through.
+	if apiToken != "" {
+		_ = os.WriteFile(filepath.Join(filepath.Dir(setup.caPath), "api-token"),
+			[]byte(apiToken+"\n"), 0o600)
+	}
 
 	// 3a. wireguard branch — auth_key is the full client config.
 	// Skip tailscale entirely (no daemon, no `tailscale up`). The

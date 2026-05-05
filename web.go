@@ -72,6 +72,7 @@ func newWebMux(g *Gateway, caDir string, ts Tailscale, publicURL string) http.Ha
 	mux.HandleFunc("/api/onboard/approve", w.apiOnboardApprove)
 	mux.HandleFunc("/api/onboard/lookup", w.apiOnboardLookup)
 	mux.HandleFunc("/api/onboard/claim", w.apiOnboardClaim)
+	mux.HandleFunc("/api/env-pushdown", w.apiEnvPushdown)
 	mux.HandleFunc("/__login", w.apiDashboardLogin)
 	mux.Handle("/", w.staticHandler())
 	return w.dashboardSecretGate(w.tailnetGate(mux))
@@ -99,9 +100,15 @@ func (w *webMux) dashboardSecretGate(next http.Handler) http.Handler {
 		"/api/onboard/claim":   true,
 		"/api/onboard/lookup":  true,
 		"/api/onboard/approve": true,
-		"/info":                true,
-		"/ca.crt":              true,
-		"/__login":             true,
+		// /api/env-pushdown is NOT public — it's gated by the
+		// per-peer bearer minted at onboard time. The handler
+		// validates `Authorization: Bearer <token>` against
+		// peer_api_tokens; dashboardSecretGate doesn't need to
+		// see it.
+		"/api/env-pushdown": true,
+		"/info":             true,
+		"/ca.crt":           true,
+		"/__login":          true,
 	}
 	// /info and /ca.crt are public-by-design (health + cert distribution).
 	// They keep working even when the dashboard is misconfigured so
@@ -323,6 +330,84 @@ func (w *webMux) mountCredentialWebhooks(mux *http.ServeMux) {
 			})
 		}
 	}
+}
+
+// apiEnvPushdown returns the env-var push-down list assembled from
+// the gateway's currently-loaded policy, scoped to the calling
+// peer's profile. Clients (`clawpatrol env`, `clawpatrol run`)
+// fetch this instead of iterating their own compiled-in plugin
+// set, so the binary on the client doesn't have to track which
+// endpoint plugins the operator has enabled on the gateway.
+//
+// Auth: requires `Authorization: Bearer <token>` where <token>
+// matches a row in peer_api_tokens. The token was minted for the
+// caller at onboard-approve time and persisted next to ca.crt by
+// `clawpatrol join`. Only the (name, value, description,
+// plugin_type) bytes for plugins reachable from the peer's
+// profile are returned; CA-bundle vars stay client-side because
+// they reference a path on the *client's* disk.
+func (w *webMux) apiEnvPushdown(rw http.ResponseWriter, r *http.Request) {
+	token := bearerFromAuthHeader(r.Header.Get("Authorization"))
+	peerIP := peerIPForAPIToken(w.g.db, token)
+	if peerIP == "" {
+		http.Error(rw, "unknown or missing peer api token", http.StatusUnauthorized)
+		return
+	}
+	profileName := w.g.profileFor(peerIP)
+	policy := w.g.Policy()
+	if policy == nil {
+		writeJSON(rw, map[string]any{"vars": []any{}})
+		return
+	}
+	prof, ok := policy.Profiles[profileName]
+	if !ok || prof == nil {
+		writeJSON(rw, map[string]any{"vars": []any{}})
+		return
+	}
+
+	out := []map[string]string{}
+	seen := map[string]bool{}
+	add := func(name, value, description, pluginType string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, map[string]string{
+			"name":        name,
+			"value":       value,
+			"description": description,
+			"plugin_type": pluginType,
+		})
+	}
+	credSeen := map[string]bool{}
+	// Endpoints in this profile, plus the credentials they bind.
+	// Credentials are emitted first (so credential-shaped
+	// placeholders win on duplicate names), endpoints second.
+	for _, ep := range prof.Endpoints {
+		for _, cc := range ep.Credentials {
+			if cc == nil || cc.Credential == nil || credSeen[cc.Credential.Symbol.Name] {
+				continue
+			}
+			credSeen[cc.Credential.Symbol.Name] = true
+			provider, ok := cc.Credential.Body.(config.EnvPushdownProvider)
+			if !ok {
+				continue
+			}
+			for _, ev := range provider.EnvVars() {
+				add(ev.Name, ev.Value, ev.Description, cc.Credential.Plugin.Type)
+			}
+		}
+	}
+	for _, ep := range prof.Endpoints {
+		provider, ok := ep.Body.(config.EnvPushdownProvider)
+		if !ok {
+			continue
+		}
+		for _, ev := range provider.EnvVars() {
+			add(ev.Name, ev.Value, ev.Description, ep.Plugin.Type)
+		}
+	}
+	writeJSON(rw, map[string]any{"vars": out})
 }
 
 func (w *webMux) staticHandler() http.Handler {
