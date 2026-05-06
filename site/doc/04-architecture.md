@@ -1,6 +1,6 @@
 # Architecture
 
-> See [Glossary](03a-glossary.md) for definitions of gateway, endpoint,
+> See [Glossary](/docs/03a-glossary/) for definitions of gateway, endpoint,
 > credential, rule, profile, plugin, runtime, and the rest of the
 > vocabulary used below.
 
@@ -353,4 +353,4 @@ prefix per RFC 1035.
 Every proxied request/response is logged to the SQLite database
 at `$CLAWPATROL_DATA/clients.db` with a 7-day retention (configurable
 via `ANALYTICS_RETENTION_DAYS`). See
-[Self-Hosting](06-self-hosting.md) for details.
+[Self-Hosting](/docs/06-self-hosting/) for details.
