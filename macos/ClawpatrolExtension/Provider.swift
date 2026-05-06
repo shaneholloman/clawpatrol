@@ -97,27 +97,49 @@ class TransparentProxyProvider: NETransparentProxyProvider {
     }
 
     private func applyNetworkSettings(completionHandler: @escaping (Error?) -> Void) {
-        // Intercept everything outbound — filter inside handleNewFlow.
+        // Exclude UDP/443 at rule layer: QUIC false-return races
+        // (radar r.98382363) cause ~30s Chrome stalls. Per-process
+        // adds UDP/53 so children resolve DNS. Settings applied once;
+        // mid-life setTunnelNetworkSettings wedges provider (691341).
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: "127.0.0.1")
-        settings.includedNetworkRules = [
+        var included: [NENetworkRule] = [
             NENetworkRule(remoteNetwork: nil, remotePrefix: 0,
                           localNetwork: nil, localPrefix: 0,
                           protocol: .TCP, direction: .outbound),
-            NENetworkRule(remoteNetwork: nil, remotePrefix: 0,
-                          localNetwork: nil, localPrefix: 0,
+        ]
+        var excluded: [NENetworkRule] = [
+            NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "0.0.0.0", port: "443"),
+                          remotePrefix: 0, localNetwork: nil, localPrefix: 0,
+                          protocol: .UDP, direction: .outbound),
+            NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "::", port: "443"),
+                          remotePrefix: 0, localNetwork: nil, localPrefix: 0,
                           protocol: .UDP, direction: .outbound),
         ]
-        settings.excludedNetworkRules = [
-            NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "224.0.0.0", port: "0"),
-                          remotePrefix: 4, localNetwork: nil, localPrefix: 0,
-                          protocol: .UDP, direction: .outbound),
-            NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "ff00::", port: "0"),
-                          remotePrefix: 8, localNetwork: nil, localPrefix: 0,
-                          protocol: .UDP, direction: .outbound),
-            NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "169.254.0.0", port: "0"),
-                          remotePrefix: 16, localNetwork: nil, localPrefix: 0,
-                          protocol: .UDP, direction: .outbound),
-        ]
+        if wholeMachine {
+            included.append(NENetworkRule(remoteNetwork: nil, remotePrefix: 0,
+                                          localNetwork: nil, localPrefix: 0,
+                                          protocol: .UDP, direction: .outbound))
+            excluded.append(contentsOf: [
+                NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "224.0.0.0", port: "0"),
+                              remotePrefix: 4, localNetwork: nil, localPrefix: 0,
+                              protocol: .UDP, direction: .outbound),
+                NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "ff00::", port: "0"),
+                              remotePrefix: 8, localNetwork: nil, localPrefix: 0,
+                              protocol: .UDP, direction: .outbound),
+                NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "169.254.0.0", port: "0"),
+                              remotePrefix: 16, localNetwork: nil, localPrefix: 0,
+                              protocol: .UDP, direction: .outbound),
+            ])
+        } else {
+            included.append(NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "0.0.0.0", port: "53"),
+                                          remotePrefix: 0, localNetwork: nil, localPrefix: 0,
+                                          protocol: .UDP, direction: .outbound))
+            included.append(NENetworkRule(remoteNetwork: NWHostEndpoint(hostname: "::", port: "53"),
+                                          remotePrefix: 0, localNetwork: nil, localPrefix: 0,
+                                          protocol: .UDP, direction: .outbound))
+        }
+        settings.includedNetworkRules = included
+        settings.excludedNetworkRules = excluded
         setTunnelNetworkSettings(settings, completionHandler: completionHandler)
     }
 
@@ -373,18 +395,32 @@ private func sessionRegister(_ pid: pid_t) {
     sessionPidsLock.lock()
     sessionPidsSet.insert(pid)
     sessionPidsLock.unlock()
-    // Ancestor cache invalidates because new session PID changes
-    // the verdict for any descendant — clear and let it re-warm.
-    ancestorCacheLock.lock()
-    ancestorCache.removeAll(keepingCapacity: true)
-    ancestorCacheLock.unlock()
+    // Do NOT invalidate the ancestor cache here. The cache stores
+    // "was this pid a descendant of any session pid I checked?". A
+    // new session pid only changes the verdict for processes that
+    // descend from it — and those processes don't exist yet at
+    // register time (the CLI registers before exec'ing the child).
+    // Dumping the cache on every register made the first 100ms
+    // after `clawpatrol run` a cold-cache storm: every Chrome
+    // helper, system service, and background daemon re-walked its
+    // full PPID chain via proc_pidinfo, the per-flow handleNewFlow
+    // latency spiked, and macOS started stalling unrelated UDP
+    // sockets.
 }
 private func sessionUnregister(_ pid: pid_t) {
     sessionPidsLock.lock()
     sessionPidsSet.remove(pid)
     sessionPidsLock.unlock()
+    // On unregister evict cache entries that pointed to this
+    // session pid — their descendants are no longer tunneled. Walk
+    // the cache once and drop the matches; cheaper than removeAll
+    // because most entries are unrelated negatives.
     ancestorCacheLock.lock()
-    ancestorCache.removeAll(keepingCapacity: true)
+    if !ancestorCache.isEmpty {
+        for (k, v) in ancestorCache where v.sessionPID == pid {
+            ancestorCache.removeValue(forKey: k)
+        }
+    }
     ancestorCacheLock.unlock()
 }
 
@@ -480,15 +516,44 @@ private func serviceSessionClient(_ fd: Int32) {
 // membership is nanoseconds.
 private let bsdInfoSize = Int32(MemoryLayout<proc_bsdinfo>.size)
 
+// ancestorCache memoizes the verdict for each (pid, start_time) seen
+// in handleNewFlow. start_time is included in the key so the cache
+// is immune to PID reuse — macOS recycles PIDs aggressively under
+// fork-heavy workloads and a stale entry under bare-pid keying could
+// flip a non-clawpatrol flow into "tunneled" or vice versa.
+//
+// Pattern matches unclaw's SessionRegistry.swift:57-61 (start-time
+// validation on read) and Apple Endpoint Security guidance (audit
+// tokens are the canonical anti-reuse key, but pidversion isn't
+// exposed via proc_pidinfo so start_time is the next best thing).
+//
+// 60s TTL: long-running browser helpers (Chrome, Slack) shouldn't
+// re-walk their PPID chain every few seconds. The reaper already
+// drops session pids within 5s of process exit, so a stale "matched"
+// verdict is at most 5s out of date.
+private struct ancestorCacheKey: Hashable {
+    let pid: pid_t
+    let startTimeSec: UInt64
+}
 private struct ancestorCacheEntry { let sessionPID: pid_t; let expires: Date }
-private var ancestorCache: [pid_t: ancestorCacheEntry] = [:]
+private var ancestorCache: [ancestorCacheKey: ancestorCacheEntry] = [:]
 private let ancestorCacheLock = NSLock()
-private let ancestorCacheTTL: TimeInterval = 5
+private let ancestorCacheTTL: TimeInterval = 60
+
+// procStartTime returns the start_time field of proc_bsdinfo for pid.
+// 0 on failure — keep the entry in cache anyway under the bare-pid
+// key so a transient lookup miss doesn't disable caching.
+private func procStartTime(_ pid: pid_t) -> UInt64 {
+    var info = proc_bsdinfo()
+    let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, bsdInfoSize)
+    return n == bsdInfoSize ? UInt64(info.pbi_start_tvsec) : 0
+}
 
 private func ancestorMatches(pid: pid_t) -> Bool {
+    let key = ancestorCacheKey(pid: pid, startTimeSec: procStartTime(pid))
     let now = Date()
     ancestorCacheLock.lock()
-    if let e = ancestorCache[pid], e.expires > now {
+    if let e = ancestorCache[key], e.expires > now {
         let v = e.sessionPID != 0
         ancestorCacheLock.unlock()
         return v
@@ -515,7 +580,7 @@ private func ancestorMatches(pid: pid_t) -> Bool {
     }
 
     ancestorCacheLock.lock()
-    ancestorCache[pid] = ancestorCacheEntry(sessionPID: sessionPID, expires: now.addingTimeInterval(ancestorCacheTTL))
+    ancestorCache[key] = ancestorCacheEntry(sessionPID: sessionPID, expires: now.addingTimeInterval(ancestorCacheTTL))
     if ancestorCache.count > 4096 {
         ancestorCache = ancestorCache.filter { $0.value.expires > now }
     }

@@ -245,16 +245,28 @@ export async function deleteAgent(ip: string): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
-export async function getAgents(): Promise<Agent[]> {
-  const r = await api("/api/agents");
+// /api/state bundles whoami + integrations + agents in one ETag'd
+// response. Module-level lastTag persists across getState calls so
+// the 304 fast path kicks in on every poll after the first; cached
+// value returned on 304 means consumers always get a non-null shape.
+//
+// Browser fetch with default cache + ETag would also revalidate, but
+// the cached body is still copied into JS land — going through If-
+// None-Match explicitly skips JSON.parse on the no-change path too.
+type StateResp = { whoami: Whoami; integrations: Integration[]; agents: Agent[] };
+let lastStateTag = "";
+let lastState: StateResp | null = null;
+export async function getState(): Promise<StateResp> {
+  const headers: Record<string, string> = {};
+  if (lastStateTag) headers["If-None-Match"] = lastStateTag;
+  const r = await fetch("/api/state", { headers, credentials: "same-origin" });
+  if (r.status === 304 && lastState) return lastState;
   if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-export async function getWhoami(): Promise<Whoami> {
-  const r = await api("/api/whoami");
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  const tag = r.headers.get("ETag");
+  if (tag) lastStateTag = tag;
+  const body = (await r.json()) as StateResp;
+  lastState = body;
+  return body;
 }
 
 export type OAuthStartResp =

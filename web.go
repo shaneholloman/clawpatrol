@@ -42,6 +42,13 @@ type webMux struct {
 	mu        sync.Mutex
 	sessions  map[string]*oauthSession
 	onboard   *onboardRegistry
+
+	// stateCache: per-caller TTL'd memo for /api/state. RWMutex
+	// because reads vastly outnumber writes — every dashboard tab
+	// polls every 5s, but the cached entry only refreshes once per
+	// stateCacheTTL (1s). 99% of polls are RLock-only.
+	stateCacheMu sync.RWMutex
+	stateCache   map[string]stateCacheEntry
 }
 
 func newWebMux(g *Gateway, caDir string, ts Tailscale, publicURL string) http.Handler {
@@ -49,9 +56,14 @@ func newWebMux(g *Gateway, caDir string, ts Tailscale, publicURL string) http.Ha
 	mux := http.NewServeMux()
 	mux.HandleFunc("/info", w.serveInfo)
 	mux.HandleFunc("/ca.crt", w.serveCA)
-	mux.HandleFunc("/api/whoami", w.apiWhoami)
+	// /api/whoami + /api/agents are gone — superseded by /api/state.
+	// /api/status stays because DevicePage scopes it with ?profile=.
 	mux.HandleFunc("/api/status", w.apiStatus)
-	mux.HandleFunc("/api/agents", w.apiAgents)
+	// /api/state is the dashboard's single-call refresh endpoint —
+	// bundles whoami+status+agents in one round-trip and returns 304
+	// when the JSON hash matches If-None-Match. Replaces the three
+	// parallel per-3s fetches App.refresh used to fire.
+	mux.HandleFunc("/api/state", w.apiState)
 	mux.HandleFunc("/api/agents/delete", w.apiAgentDelete)
 	mux.HandleFunc("/api/agents/profile", w.apiAgentProfile)
 	mux.HandleFunc("/api/profiles", w.apiProfiles)
@@ -480,21 +492,90 @@ func (w *webMux) ownerForCaller(r *http.Request) (key, label string) {
 	return host, host
 }
 
-func (w *webMux) apiWhoami(rw http.ResponseWriter, r *http.Request) {
+// whoamiData backs the whoami slice of /api/state. No HTTP handler —
+// the route was removed once App.tsx switched to the bundled
+// /api/state response.
+func (w *webMux) whoamiData(r *http.Request) map[string]string {
 	user, device, host := w.callerIdentity(r)
-	// Read public_url straight from the live config so that an
-	// operator editing gateway.hcl sees the new value reflected
-	// without a gateway restart (mtime watcher swaps cfg).
 	pu := w.g.cfg.PublicURL
 	if pu == "" {
 		pu = w.publicURL
 	}
-	writeJSON(rw, map[string]string{
+	return map[string]string{
 		"user":       user,
 		"device":     device,
 		"host":       host,
 		"public_url": pu,
-	})
+	}
+}
+
+// apiState is the dashboard's combined refresh endpoint. Bundles
+// whoami + status (integrations) + agents into one response with an
+// ETag — when the JSON hash matches If-None-Match the gateway returns
+// 304 with no body. Server-side caches the last (tag, body) under a
+// short TTL so concurrent dashboards on the same tag answer 304
+// without re-marshaling+hashing; only the first request per change-
+// window pays the full cost. Whoami varies per-caller so the cache
+// is keyed by (caller-user, profile).
+//
+// Cache TTL is conservatively short (1s) so changes propagate to
+// idle dashboards within their 5s poll window without us needing a
+// real invalidation hook off every credential mutation.
+func (w *webMux) apiState(rw http.ResponseWriter, r *http.Request) {
+	user, _, _ := w.callerIdentity(r)
+	cacheKey := user + "|" + r.URL.Query().Get("profile")
+	now := time.Now()
+
+	w.stateCacheMu.RLock()
+	if c, ok := w.stateCache[cacheKey]; ok && now.Sub(c.At) < stateCacheTTL {
+		body, tag := c.Body, c.Tag
+		w.stateCacheMu.RUnlock()
+		serveState(rw, r, body, tag)
+		return
+	}
+	w.stateCacheMu.RUnlock()
+
+	state := map[string]any{
+		"whoami":       w.whoamiData(r),
+		"integrations": w.statusList(r),
+		"agents":       w.agentsList(),
+	}
+	body, err := json.Marshal(state)
+	if err != nil {
+		http.Error(rw, err.Error(), 500)
+		return
+	}
+	sum := sha256.Sum256(body)
+	tag := `"` + hex.EncodeToString(sum[:8]) + `"`
+
+	w.stateCacheMu.Lock()
+	if w.stateCache == nil {
+		w.stateCache = map[string]stateCacheEntry{}
+	}
+	w.stateCache[cacheKey] = stateCacheEntry{Body: body, Tag: tag, At: now}
+	w.stateCacheMu.Unlock()
+
+	serveState(rw, r, body, tag)
+}
+
+const stateCacheTTL = 1 * time.Second
+
+type stateCacheEntry struct {
+	Body []byte
+	Tag  string
+	At   time.Time
+}
+
+func serveState(rw http.ResponseWriter, r *http.Request, body []byte, tag string) {
+	if r.Header.Get("If-None-Match") == tag {
+		rw.Header().Set("ETag", tag)
+		rw.WriteHeader(http.StatusNotModified)
+		return
+	}
+	rw.Header().Set("ETag", tag)
+	rw.Header().Set("Content-Type", "application/json")
+	rw.Header().Set("Cache-Control", "no-cache")
+	rw.Write(body)
 }
 
 // apiStatus returns the credentials list for the dashboard. Filters
@@ -756,9 +837,9 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	fmt.Fprint(rw, ": connected\n\n")
-	// Replay backlog (oldest → newest) so a refreshed dashboard sees the
-	// last few hundred events instead of an empty stream. Frontend
-	// prepends each event, so newest still ends up at the top.
+	// Replay backlog (oldest → newest). Backlog events are unmarshaled
+	// Event values from the recent ring; live events ship pre-marshaled
+	// in eventPacket.raw so we skip a Marshal call per subscriber.
 	for _, ev := range backlog {
 		if wantIP != "" && ev.AgentIP != wantIP {
 			continue
@@ -781,18 +862,14 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 		case <-keepalive.C:
 			fmt.Fprint(rw, ": ka\n\n")
 			flusher.Flush()
-		case ev, ok := <-ch:
+		case pkt, ok := <-ch:
 			if !ok {
 				return
 			}
-			if wantIP != "" && ev.AgentIP != wantIP {
+			if wantIP != "" && pkt.ev.AgentIP != wantIP {
 				continue
 			}
-			b, err := json.Marshal(ev)
-			if err != nil {
-				continue
-			}
-			fmt.Fprintf(rw, "data: %s\n\n", b)
+			fmt.Fprintf(rw, "data: %s\n\n", pkt.raw)
 			flusher.Flush()
 		}
 	}
@@ -912,21 +989,47 @@ type Event struct {
 	Direction string `json:"direction,omitempty"`
 }
 
+// eventPacket carries an event plus its marshaled JSON bytes. drain()
+// marshals once and ships the same bytes to every subscriber so a
+// busy gateway doesn't pay N × json.Marshal per event when N
+// dashboards are connected.
+type eventPacket struct {
+	ev  Event
+	raw []byte
+}
+
 type Sink struct {
-	ch        chan Event
-	db        *sql.DB
-	drops     atomic.Uint64
-	mu        sync.Mutex
-	subs      []chan Event
-	recent    []Event // ring of recent events for backlog replay
-	recentCap int
+	ch    chan Event
+	db    *sql.DB
+	drops atomic.Uint64
+	mu    sync.Mutex
+	subs  []chan eventPacket
+	// Recent ring backlog. recent is sized once at construction; we
+	// write at recentNext (modulo cap) and rotate. Old behavior used
+	// `append + slice` which reallocated on every overflow, churning
+	// GC at ~10 alloc/sec on a busy gateway. Lazy fill: until we wrap,
+	// recentLen tracks valid entries.
+	recent     []Event
+	recentNext int
+	recentLen  int
+	recentCap  int
 }
 
 func NewSink(db *sql.DB, buf int) (*Sink, error) {
 	s := &Sink{ch: make(chan Event, buf), db: db, recentCap: 500}
+	s.recent = make([]Event, s.recentCap)
 	if db != nil {
 		if seed, err := readTailEvents(db, s.recentCap); err == nil && len(seed) > 0 {
-			s.recent = seed
+			// Seed fills oldest→newest; place at indices 0..len(seed)-1
+			// and set recentNext to the next slot, recentLen to length.
+			n := len(seed)
+			if n > s.recentCap {
+				seed = seed[n-s.recentCap:]
+				n = s.recentCap
+			}
+			copy(s.recent, seed)
+			s.recentLen = n
+			s.recentNext = n % s.recentCap
 		}
 	}
 	go s.drain()
@@ -1041,51 +1144,82 @@ func (s *Sink) drain() {
 				e.ReqBody, e.RespBody,
 				string(rqhJSON), string(rshJSON))
 		}
+
+		// Marshal once per event regardless of subscriber count. Old
+		// path marshaled inside each subscriber's SSE handler — N
+		// dashboards = N json.Marshal calls per event. Now it's 1.
+		raw, err := json.Marshal(e)
+		if err != nil {
+			continue
+		}
+		pkt := eventPacket{ev: e, raw: raw}
+
 		s.mu.Lock()
-		// Recent ring is the SSE backlog replayed to fresh
-		// dashboards. start events without matching ends would render
-		// as stuck in-flight rows on every reconnect, so only keep
-		// terminal events. frame events for already-closed WS streams
-		// also have nowhere to go on reconnect.
+		// Recent ring updated under lock since RecentAndSubscribe
+		// snapshots it. Circular write: O(1) regardless of cap.
+		// Strip bodies from the backlog copy — SSE consumers only
+		// need metadata; the detail page fetches full data via
+		// /api/actions/<id>.
 		if persist {
-			// Strip bodies from backlog — SSE consumers
-			// (LiveRequests, AnalyticsPage) only need
-			// metadata; the detail page fetches full data
-			// via /api/actions/<id>.
 			lite := e
 			lite.ReqBody = ""
 			lite.RespBody = ""
 			lite.ReqHeaders = nil
 			lite.RespHeaders = nil
-			s.recent = append(s.recent, lite)
-			if len(s.recent) > s.recentCap {
-				s.recent = s.recent[len(s.recent)-s.recentCap:]
+			s.recent[s.recentNext] = lite
+			s.recentNext = (s.recentNext + 1) % s.recentCap
+			if s.recentLen < s.recentCap {
+				s.recentLen++
 			}
 		}
-		for _, sub := range s.subs {
+		// Copy subs out of the lock, fan-out without holding mu so
+		// a slow channel doesn't serialize the gateway. Cheap copy
+		// (slice of channel pointers, len ~= dashboards open).
+		subs := append([]chan eventPacket(nil), s.subs...)
+		s.mu.Unlock()
+
+		for _, sub := range subs {
 			select {
-			case sub <- e:
+			case sub <- pkt:
 			default:
 				// slow consumer; drop
+				s.drops.Add(1)
 			}
 		}
-		s.mu.Unlock()
 	}
+}
+
+// recentSnapshot copies the ring into a flat oldest→newest slice.
+// Caller must hold s.mu (or call from RecentAndSubscribe which does).
+func (s *Sink) recentSnapshot() []Event {
+	if s.recentLen == 0 {
+		return nil
+	}
+	out := make([]Event, s.recentLen)
+	if s.recentLen < s.recentCap {
+		copy(out, s.recent[:s.recentLen])
+		return out
+	}
+	// Wrapped: oldest entry sits at recentNext, walk forward modulo cap.
+	for i := 0; i < s.recentCap; i++ {
+		out[i] = s.recent[(s.recentNext+i)%s.recentCap]
+	}
+	return out
 }
 
 // RecentAndSubscribe atomically snapshots the backlog and registers a
 // subscriber under the same lock so no event is missed or duplicated
-// between the two. Caller should write the snapshot first, then loop on
-// the channel for new events.
-func (s *Sink) RecentAndSubscribe() ([]Event, <-chan Event, func()) {
+// between the two. Channel ships eventPackets — drain marshaled the
+// JSON once and shares those bytes across every subscriber.
+func (s *Sink) RecentAndSubscribe() ([]Event, <-chan eventPacket, func()) {
 	if s == nil {
-		ch := make(chan Event)
+		ch := make(chan eventPacket)
 		close(ch)
 		return nil, ch, func() {}
 	}
-	ch := make(chan Event, 64)
+	ch := make(chan eventPacket, 64)
 	s.mu.Lock()
-	snap := append([]Event(nil), s.recent...)
+	snap := s.recentSnapshot()
 	s.subs = append(s.subs, ch)
 	s.mu.Unlock()
 	cancel := func() {
@@ -1101,7 +1235,7 @@ func (s *Sink) RecentAndSubscribe() ([]Event, <-chan Event, func()) {
 	return snap, ch, cancel
 }
 
-func (s *Sink) Subscribe() (<-chan Event, func()) {
+func (s *Sink) Subscribe() (<-chan eventPacket, func()) {
 	_, ch, cancel := s.RecentAndSubscribe()
 	return ch, cancel
 }
