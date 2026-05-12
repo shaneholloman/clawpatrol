@@ -10,7 +10,7 @@ package main
 // Each facet block carries ONLY that facet's CEL-visible fields —
 // the same vocabulary rules read in `condition = "<facet>.<field>"`.
 // Connection-level fields (host, credential, peer_ip) sit outside
-// the facet block on `action` itself. See doc/test.md.
+// the facet block on `action` itself. See site/doc/clawpatrol-test.md.
 
 import (
 	"encoding/base64"
@@ -27,14 +27,16 @@ import (
 	sqlfacet "github.com/denoland/clawpatrol/config/plugins/facets/sql"
 )
 
-// Fixture is the on-disk shape.
+// Fixture is the on-disk shape. Field order matters for marshalling:
+// `action` (what happened) reads first, `match` (what the runner
+// asserts about it) reads second.
 type Fixture struct {
-	Match  Match  `json:"match"`
 	Action Action `json:"action"`
+	Match  Match  `json:"match"`
 }
 
 // Match is what the rule engine produced (or what the runner
-// should assert). Approve is terminal — see doc/test.md.
+// should assert). Approve is terminal — see site/doc/clawpatrol-test.md.
 type Match struct {
 	Verdict  string `json:"verdict"` // allow | deny | approve | passthrough
 	Rule     string `json:"rule,omitempty"`
