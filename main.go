@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/denoland/clawpatrol/config"
+	"github.com/denoland/clawpatrol/config/extplugin"
 	"github.com/denoland/clawpatrol/config/facet"
 	"github.com/denoland/clawpatrol/config/match"
 	_ "github.com/denoland/clawpatrol/config/plugins/all"
@@ -110,7 +111,9 @@ func newReqID() string {
 }
 
 // loadConfig parses the gateway HCL via the typed-block grammar and
-// compiles it into a runtime CompiledPolicy.
+// compiles it into a runtime CompiledPolicy. Plugin loading goes
+// through config's package-global PluginLoader, installed once at
+// process startup via config.SetPluginLoader.
 func loadConfig(path string) (*config.Gateway, *config.CompiledPolicy, error) {
 	gw, diags := config.Load(path)
 	if diags.HasErrors() {
@@ -2264,6 +2267,7 @@ func runGateway(args []string) {
 	cfgPath := rest[0]
 
 	startModelRefresh()
+	config.SetPluginLoader(extplugin.New(log.Default()))
 	cfg, policy, err := loadConfig(cfgPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || strings.Contains(err.Error(), "no such file") {
