@@ -44,7 +44,9 @@ type JoinConfig = config.JoinConfig
 
 // resolveStateDir picks the directory where the gateway keeps its
 // sqlite DB. The HCL `state_dir` attribute is the only knob;
-// defaults to ${HOME}/.clawpatrol/state when unset.
+// defaults to ${HOME}/.clawpatrol when unset. The DB filename
+// (clawpatrol.db) coexists with the client-side ca.crt that lives
+// in the same dir on dev machines.
 func resolveStateDir(cfg *config.Gateway) string {
 	if cfg.StateDir != "" {
 		return cfg.StateDir
@@ -53,7 +55,28 @@ func resolveStateDir(cfg *config.Gateway) string {
 	if err != nil || home == "" {
 		log.Fatalf("state_dir unset and $HOME unavailable")
 	}
-	return filepath.Join(home, ".clawpatrol", "state")
+	return filepath.Join(home, ".clawpatrol")
+}
+
+// warnIfStateLooselyPermissioned logs a warning when state_dir or
+// clawpatrol.db is readable by group / others. The sqlite db holds
+// the CA private key, OAuth tokens, and audit log — anything not
+// owned and 0700/0600 is a credential-leak path. Non-fatal so a
+// fresh-from-mkdir setup that hasn't yet been tightened can still
+// boot.
+func warnIfStateLooselyPermissioned(stateDir string) {
+	check := func(path string, want os.FileMode) {
+		st, err := os.Stat(path)
+		if err != nil {
+			return
+		}
+		mode := st.Mode().Perm()
+		if mode&0o077 != 0 {
+			log.Printf("warning: %s has mode %#o (want %#o); CA key + OAuth tokens are readable beyond owner. Tighten with: chmod %#o %s", path, mode, want, want, path)
+		}
+	}
+	check(stateDir, 0o700)
+	check(filepath.Join(stateDir, "clawpatrol.db"), 0o600)
 }
 
 // emit a terminal request event to both the SSE sink and OTel.
@@ -2285,6 +2308,7 @@ func runGateway(args []string) {
 	if err != nil {
 		log.Fatalf("db: %v", err)
 	}
+	warnIfStateLooselyPermissioned(stateDir)
 	setDB(db)
 	blobs := newGatewayBlobStore(db)
 	endpoints.SetBlobStore(blobs)
