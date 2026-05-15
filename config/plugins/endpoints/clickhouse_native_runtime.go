@@ -20,7 +20,6 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/cityhash102"
 	chproto "github.com/ClickHouse/clickhouse-go/v2/lib/proto"
 
-	"github.com/denoland/clawpatrol/config"
 	"github.com/denoland/clawpatrol/config/facet"
 	"github.com/denoland/clawpatrol/config/match"
 	sqlfacet "github.com/denoland/clawpatrol/config/plugins/facets/sql"
@@ -172,48 +171,24 @@ func (ClickhouseNativeEndpointRuntime) HandleConn(ctx context.Context, ch *runti
 		return fmt.Errorf("read hello: %w", err)
 	}
 
-	// Step 1.5: when more than one clickhouse_native endpoint claims
-	// this host (per-database routing), pick the endpoint whose
-	// `database` field matches Hello.Database. Specific beats
-	// catch-all (Database == ""); the compile pass already rejected
-	// two specifics on the same database or two catch-alls on the
-	// same host, so the choice is unambiguous. The dispatcher set
-	// ch.Endpoint to one of the candidates as an initial guess; we
-	// overwrite with the protocol-correct pick so downstream wiring
-	// (credential, rules, event Endpoint name) reflects the actual
-	// claim.
-	if len(ch.Candidates) > 1 {
-		picked := pickClickhouseNativeByDatabase(ch.Candidates, hello.Database)
-		if picked == nil {
-			chEmitError(ch, "no-endpoint-for-database", hello.Database)
-			return fmt.Errorf("clickhouse_native: no endpoint on host %q claims database %q", ch.UpstreamHost, hello.Database)
-		}
-		if picked != ch.Endpoint {
-			ch.Endpoint = picked
-			pickedEp, pickedOk := picked.Body.(*ClickhouseNativeEndpoint)
-			if !pickedOk {
-				err := fmt.Errorf("clickhouse_native runtime invoked on non-native endpoint %v", picked)
-				chEmitError(ch, "wrong-endpoint-type", picked.Name)
-				return err
-			}
-			chEp = pickedEp
-			// chPickUpstream depends on the picked endpoint's Hosts
-			// (and its default port); rebuild the upstream addr.
-			upstreamAddr = chPickUpstream(ch.Endpoint.Hosts, ch.UpstreamHost, ch.DstPort, chEp.port())
-			if upstreamAddr == "" {
-				chEmitError(ch, "no-host", ch.Endpoint.Name)
-				return fmt.Errorf("clickhouse_native endpoint %q has no host", ch.Endpoint.Name)
-			}
-		}
-	}
-
 	// Step 2: resolve credential and inject. Single-credential native
 	// endpoints today; multi-credential dispatch via placeholder lands
 	// when SQL parsing does in iter 2.
 	claimedUser := hello.Username
 	injected := false
 	credName := ""
-	if cc := chPickCredential(ch.Endpoint); cc != nil {
+	// Build a partial match.Request for credential dispatch. The
+	// ClickhouseNativeEndpointRuntime's PlaceholderDetector scans
+	// Meta.Statement for a placeholder substring; the agent's
+	// Hello.Username + NUL + Hello.Password gives it both fields to
+	// search. Database is the agent-declared target so any
+	// `database`/`databases` constraint can filter on it.
+	credReq := &match.Request{
+		Family:   "sql",
+		Database: hello.Database,
+		Meta:     &sqlfacet.Meta{Statement: hello.Username + "\x00" + hello.Password},
+	}
+	if cc := runtime.ResolveCredential(ch.Endpoint, credReq); cc != nil {
 		credName = cc.Credential.Symbol.Name
 		auth, ok := cc.Credential.Body.(runtime.ClickhouseAuthCredential)
 		if !ok {
@@ -314,6 +289,11 @@ func chUpstreamTLSConfig(host string, acceptInvalidCert bool) *tls.Config {
 // server Hello (forwarded verbatim to the agent), captures the
 // negotiated revision, then runs agent → server through the Query /
 // Data inspector while server → agent stays a pure passthrough.
+// database is the agent-declared target database (Hello.Database) —
+// propagated into every per-Query match.Request.Database so rules
+// can match on `sql.database`. Connection-scoped state in
+// chAgentToServer rolls the value forward when an allowed `USE db`
+// switches the active database.
 func chRunSession(ctx context.Context, ch *runtime.ConnHandle, agentReader *chgoproto.Reader, upstream net.Conn, clientRev int, credName, database string) {
 	upstreamReader := chgoproto.NewReader(upstream)
 	negotiatedRev, err := chReadAndForwardServerHello(upstreamReader, ch.Conn, clientRev)
@@ -931,6 +911,7 @@ func chEvaluateSQL(ctx context.Context, ch *runtime.ConnHandle, sql, credName, d
 		Family:     "sql",
 		PeerIP:     ch.PeerIP,
 		Credential: credName,
+		Database:   database,
 		Meta: &sqlfacet.Meta{
 			Verb:      info.Verb,
 			Tables:    info.Tables,
@@ -1028,16 +1009,6 @@ func chEmitError(ch *runtime.ConnHandle, reason, detail string) {
 		Reason:  reason,
 		Summary: summary,
 	})
-}
-
-// chPickCredential returns the (only) credential bound to the
-// endpoint, or nil. Multi-credential dispatch by placeholder will
-// move into the SQL-parsing iteration.
-func chPickCredential(ep *config.CompiledEndpoint) *config.CompiledCredential {
-	if ep == nil || len(ep.Credentials) == 0 {
-		return nil
-	}
-	return ep.Credentials[0]
 }
 
 // chPickUpstream resolves the upstream addr the plugin should dial.

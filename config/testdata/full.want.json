@@ -151,6 +151,18 @@
         },
         "type": "clickhouse_credential"
       },
+      "ch-o11y-dev": {
+        "body": {
+          "User": "dev_app"
+        },
+        "type": "clickhouse_credential"
+      },
+      "ch-o11y-prod": {
+        "body": {
+          "User": "prod_app"
+        },
+        "type": "clickhouse_credential"
+      },
       "checkly-alice": {
         "body": {
           "IdempotencyKey": false
@@ -351,8 +363,24 @@
             "clickhouse-o11y.example",
             "ch-o11y.internal.example"
           ],
-          "Database": "",
-          "Credential": "ch-o11y"
+          "Credential": "",
+          "Credentials": [
+            {
+              "databases": [
+                "prod"
+              ],
+              "credential": "ch-o11y-prod"
+            },
+            {
+              "databases": [
+                "dev"
+              ],
+              "credential": "ch-o11y-dev"
+            },
+            {
+              "credential": "ch-o11y"
+            }
+          ]
         },
         "family": "sql",
         "type": "clickhouse_https"
@@ -365,8 +393,24 @@
           "Port": 0,
           "TLS": false,
           "AcceptInvalidCertificate": false,
-          "Database": "",
-          "Credential": "ch-o11y"
+          "Credential": "",
+          "Credentials": [
+            {
+              "databases": [
+                "prod"
+              ],
+              "credential": "ch-o11y-prod"
+            },
+            {
+              "databases": [
+                "dev"
+              ],
+              "credential": "ch-o11y-dev"
+            },
+            {
+              "credential": "ch-o11y"
+            }
+          ]
         },
         "family": "sql",
         "type": "clickhouse_native"
@@ -551,7 +595,6 @@
       "pg-corp": {
         "body": {
           "Host": "corp-prod.cluster.example:5432",
-          "Database": "corp",
           "SSLMode": "",
           "Credential": "",
           "Credentials": [
@@ -571,7 +614,6 @@
       "pg-scheduler": {
         "body": {
           "Host": "scheduler-prod.cluster.example:5432",
-          "Database": "scheduler",
           "SSLMode": "",
           "Credential": "pg-scheduler-cred"
         },
@@ -757,6 +799,19 @@
           "priority": -100,
           "verdict": "deny",
           "reason": "ClickHouse access is read-only"
+        }
+      },
+      "clickhouse-prod-readonly": {
+        "body": {
+          "name": "clickhouse-prod-readonly",
+          "family": "sql",
+          "endpoints": [
+            "ch-o11y-https",
+            "ch-o11y-native"
+          ],
+          "priority": 10,
+          "condition": "sql.database == 'prod' && sql.verb in ['select', 'show', 'describe', 'explain']",
+          "verdict": "allow"
         }
       },
       "clickhouse-reads": {

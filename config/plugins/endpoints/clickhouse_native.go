@@ -15,6 +15,7 @@ package endpoints
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
@@ -44,19 +45,15 @@ import (
 // same name: when true and tls is on, the gateway skips upstream cert
 // validation. Use for self-hosted ClickHouse fronted by a private CA.
 // Default false keeps full validation against system roots.
-// Database, when set, restricts this endpoint to connections whose
-// agent-declared database (Hello.Database) equals the configured
-// value. Unset = catch-all: the endpoint claims connections to its
-// host regardless of database, which preserves the v1 single-endpoint
-// behavior. Specific beats catch-all when both are bound to the same
-// host (the dispatcher reads Hello before picking).
 type ClickhouseNativeEndpoint struct {
-	Hosts                    []string `hcl:"hosts"`
-	Port                     int      `hcl:"port,optional"`
-	TLS                      bool     `hcl:"tls,optional"`
-	AcceptInvalidCertificate bool     `hcl:"accept_invalid_certificate,optional"`
-	Database                 string   `hcl:"database,optional"`
-	Credential               string   `hcl:"credential,optional"`
+	Hosts                    []string  `hcl:"hosts"`
+	Port                     int       `hcl:"port,optional"`
+	TLS                      bool      `hcl:"tls,optional"`
+	AcceptInvalidCertificate bool      `hcl:"accept_invalid_certificate,optional"`
+	Credential               string    `hcl:"credential,optional"`
+	CredentialsRaw           cty.Value `hcl:"credentials,optional" json:"-"`
+
+	Credentials []CredentialEntry `json:"Credentials,omitempty"`
 }
 
 // EndpointHosts returns the endpoint's host:port list, normalized so
@@ -80,14 +77,13 @@ func (e *ClickhouseNativeEndpoint) EndpointHosts() []string {
 
 // EndpointCredentials is part of the clawpatrol plugin API.
 func (e *ClickhouseNativeEndpoint) EndpointCredentials() []config.CredBinding {
-	return singleBinding(e.Credential)
+	return bindings(e.Credential, e.Credentials)
 }
 
-// DispatchDatabase opts the endpoint into the compile-time
-// database-routing uniqueness check (config.DatabaseRouter). The
-// runtime reads the value via the same accessor when picking among
-// candidate endpoints that share a host.
-func (e *ClickhouseNativeEndpoint) DispatchDatabase() string { return e.Database }
+func (e *ClickhouseNativeEndpoint) credentialAndRaw() (string, cty.Value) {
+	return e.Credential, e.CredentialsRaw
+}
+func (e *ClickhouseNativeEndpoint) setCredentialEntries(es []CredentialEntry) { e.Credentials = es }
 
 // RequiresVIP opts the endpoint into DNS-VIP interception. The wire
 // protocol carries no SNI / Host header, so the gateway can't
@@ -135,9 +131,32 @@ func (ClickhouseNativeEndpointRuntime) ParseStatement(sql string) any {
 	}
 }
 
+// DetectPlaceholder scans the agent's Hello (username + password) for
+// any candidate placeholder substring and returns the first match.
+// The clickhouse_native runtime constructs a partial match.Request
+// whose Meta.Statement carries `username + "\x00" + password` for
+// detector consumption — same shape postgres uses.
+func (ClickhouseNativeEndpointRuntime) DetectPlaceholder(req *runtime.Request, candidates []string) string {
+	if req == nil {
+		return ""
+	}
+	meta, _ := req.Meta.(*sqlfacet.Meta)
+	if meta == nil {
+		return ""
+	}
+	hay := meta.Statement
+	for _, c := range candidates {
+		if c != "" && strings.Contains(hay, c) {
+			return c
+		}
+	}
+	return ""
+}
+
 func init() {
 	var _ runtime.ConnEndpointRuntime = ClickhouseNativeEndpointRuntime{}
 	var _ runtime.SQLParser = ClickhouseNativeEndpointRuntime{}
+	var _ runtime.PlaceholderDetector = ClickhouseNativeEndpointRuntime{}
 	config.Register(&config.Plugin{
 		Kind:     config.KindEndpoint,
 		Type:     "clickhouse_native",
@@ -159,68 +178,30 @@ func init() {
 			if e.AcceptInvalidCertificate {
 				b.SetAttributeValue("accept_invalid_certificate", cty.BoolVal(true))
 			}
-			if e.Database != "" {
-				b.SetAttributeValue("database", cty.StringVal(e.Database))
-			}
-			if e.Credential != "" {
-				config.SetIdent(b, "credential", e.Credential)
-			}
+			emitCredentialBinding(b, e.Credential, e.Credentials, "placeholder")
 		},
 	})
 }
 
-// pickClickhouseNativeByDatabase chooses an endpoint from a set of
-// clickhouse_native candidates whose Database fields disagree.
-// Candidates are the same-host siblings the dispatcher saw at
-// dispatch time; database is Hello.Database read from the agent's
-// session-startup packet. Precedence: a candidate whose Database
-// equals database wins; otherwise the catch-all (Database == "")
-// wins. Returns nil when the input is empty OR when there is no
-// catch-all and no specific match — the dispatcher then refuses the
-// connection rather than silently routing through an unrelated
-// endpoint. The compile pass already rejected duplicate (host,
-// Database) pairs, so the picked endpoint is unambiguous.
-func pickClickhouseNativeByDatabase(candidates []*config.CompiledEndpoint, database string) *config.CompiledEndpoint {
-	if len(candidates) == 0 {
-		return nil
-	}
-	var catchAll *config.CompiledEndpoint
-	for _, c := range candidates {
-		if c == nil {
-			continue
-		}
-		body, ok := c.Body.(*ClickhouseNativeEndpoint)
-		if !ok {
-			continue
-		}
-		if body.Database == "" {
-			if catchAll == nil {
-				catchAll = c
-			}
-			continue
-		}
-		if body.Database == database {
-			return c
-		}
-	}
-	return catchAll
-}
-
 // validateClickhouseNativeEndpoint rejects accept_invalid_certificate
 // when tls is off — the flag only affects the upstream TLS handshake,
-// so without tls there's nothing for it to do.
+// so without tls there's nothing for it to do — and additionally
+// runs the shared multi-credential validator (the credentials list
+// shape is the same as postgres / https).
 func validateClickhouseNativeEndpoint(d any, name string, ctx *config.BuildCtx) hcl.Diagnostics {
+	var diags hcl.Diagnostics
 	e, ok := d.(*ClickhouseNativeEndpoint)
 	if !ok {
 		return nil
 	}
 	if e.AcceptInvalidCertificate && !e.TLS {
-		return hcl.Diagnostics{{
+		diags = append(diags, &hcl.Diagnostic{
 			Severity: hcl.DiagError,
 			Summary:  fmt.Sprintf("accept_invalid_certificate set without tls on clickhouse_native endpoint %q", name),
 			Detail:   "accept_invalid_certificate only affects the upstream TLS handshake; set `tls = true` to enable TLS, or remove accept_invalid_certificate.",
 			Subject:  &ctx.Block.DefRange,
-		}}
+		})
 	}
-	return nil
+	diags = append(diags, multiCredValidate(d, name, ctx)...)
+	return diags
 }

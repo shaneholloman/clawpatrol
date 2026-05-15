@@ -341,22 +341,13 @@ Registered types: [`clickhouse_https`](#endpoint-clickhousehttps), [`clickhouse_
 
 ### `endpoint "clickhouse_https" "<name>"`
 
-Is part of the clawpatrol plugin API.
-
-Database, when set, restricts this endpoint to requests whose
-agent-declared database (the `database` URL query parameter or
-`X-ClickHouse-Database` header, query wins when both are set)
-equals the configured value. Unset = catch-all: the endpoint claims
-every request to its host regardless of database. Specific beats
-catch-all when both are bound to the same host.
-
 Family: `sql`.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `hosts` | `[]string` | yes |  |
-| `database` | `string` | no |  |
 | `credential` | `ref(credential)` | no |  |
+| `credentials` | `[]credential` | no |  |
 
 ```hcl
 endpoint "clickhouse_https" "example" {
@@ -385,12 +376,6 @@ AcceptInvalidCertificate mirrors clickhouse-client's flag of the
 same name: when true and tls is on, the gateway skips upstream cert
 validation. Use for self-hosted ClickHouse fronted by a private CA.
 Default false keeps full validation against system roots.
-Database, when set, restricts this endpoint to connections whose
-agent-declared database (Hello.Database) equals the configured
-value. Unset = catch-all: the endpoint claims connections to its
-host regardless of database, which preserves the v1 single-endpoint
-behavior. Specific beats catch-all when both are bound to the same
-host (the dispatcher reads Hello before picking).
 
 Family: `sql`.
 
@@ -400,8 +385,8 @@ Family: `sql`.
 | `port` | `int` | no |  |
 | `tls` | `bool` | no |  |
 | `accept_invalid_certificate` | `bool` | no |  |
-| `database` | `string` | no |  |
 | `credential` | `ref(credential)` | no |  |
+| `credentials` | `[]credential` | no |  |
 
 ```hcl
 endpoint "clickhouse_native" "example" {
@@ -488,7 +473,6 @@ Family: `sql`.
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `host` | `string` | yes |  |
-| `database` | `string` | yes |  |
 | `sslmode` | `string` | no |  |
 | `credential` | `ref(credential)` | no |  |
 | `credentials` | `[]credential` | no |  |
@@ -496,7 +480,6 @@ Family: `sql`.
 ```hcl
 endpoint "postgres" "example" {
   host = "db.internal:5432"
-  database = "appdb"
 }
 ```
 

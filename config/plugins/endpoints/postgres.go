@@ -8,7 +8,6 @@ package endpoints
 //
 //   endpoint "postgres" "writer" {
 //     host       = "db.example.com:5432"
-//     database   = "postgres"
 //     sslmode    = "prefer"        // disable | prefer | require | verify-full
 //     credential = pg-writer-cred
 //   }
@@ -70,7 +69,6 @@ import (
 // encrypts the path.
 type PostgresEndpoint struct {
 	Host           string    `hcl:"host"`
-	Database       string    `hcl:"database"`
 	SSLMode        string    `hcl:"sslmode,optional"`
 	Credential     string    `hcl:"credential,optional"`
 	CredentialsRaw cty.Value `hcl:"credentials,optional" json:"-"`
@@ -152,7 +150,6 @@ func init() {
 		Emit: func(body any, _ string, b *hclwrite.Body) {
 			e := body.(*PostgresEndpoint)
 			b.SetAttributeValue("host", cty.StringVal(e.Host))
-			b.SetAttributeValue("database", cty.StringVal(e.Database))
 			emitCredentialBinding(b, e.Credential, e.Credentials, "placeholder")
 		},
 	})
@@ -224,7 +221,17 @@ func (PostgresEndpointRuntime) HandleConn(ctx context.Context, ch *runtime.ConnH
 	// credential. Single-credential endpoints fall through to the
 	// only entry.
 	agentUser := pgStartupParam(startupBody, "user")
-	cc := pgResolveCredential(ch.Endpoint, agentUser)
+	// Build a partial match.Request for credential dispatch. The
+	// PostgresEndpointRuntime's PlaceholderDetector scans
+	// Meta.Statement for a placeholder substring; Database is the
+	// agent-declared target so any `database`/`databases` constraint
+	// on a credential entry can filter against it.
+	credReq := &match.Request{
+		Family:   "sql",
+		Database: database,
+		Meta:     &sqlfacet.Meta{Statement: agentUser},
+	}
+	cc := runtime.ResolveCredential(ch.Endpoint, credReq)
 	if cc == nil {
 		pgWriteError(ch.Conn, "no credential bound to postgres endpoint")
 		return fmt.Errorf("no credential")
@@ -382,8 +389,9 @@ const maxPgMessage = 1 << 20
 
 // pgClientToServer pumps the agent's outbound message stream to the
 // upstream, inspecting Query / Parse for policy. database is the
-// session-start database (from the agent's StartupMessage) and is
-// stamped on every match.Request.Meta the matcher sees.
+// session-start database (StartupMessage `database`, or the `user`
+// fallback per pg convention) — propagated into match.Request.Database
+// on every per-Query request so rules can match on `sql.database`.
 //
 // Postgres has no in-protocol way to swap the active database for an
 // open connection — there's no `USE db` analogue, and `SET database`
@@ -526,7 +534,8 @@ func pgHandleOversizeFrame(ch *runtime.ConnHandle, upstream net.Conn, credName, 
 		Family:     "sql",
 		PeerIP:     ch.PeerIP,
 		Credential: credName,
-		Meta:       &sqlfacet.Meta{Database: database},
+		Database:   database,
+		Meta:       &sqlfacet.Meta{},
 		Truncated:  true,
 	}
 	var facets map[string]any
@@ -622,6 +631,7 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 		Family:     "sql",
 		PeerIP:     ch.PeerIP,
 		Credential: credName,
+		Database:   database,
 		Meta: &sqlfacet.Meta{
 			Verb:      info.Verb,
 			Tables:    info.Tables,
@@ -726,35 +736,6 @@ func pgWriteDeny(conn net.Conn, reason string) {
 	// Z (ReadyForQuery) — 5 bytes total: 'Z' + length(5) + 'I'.
 	ready := []byte{'Z', 0, 0, 0, 5, 'I'}
 	_, _ = conn.Write(append(msg, ready...))
-}
-
-// pgResolveCredential picks the credential entry for this connection.
-//
-// Single-binding endpoints (one entry, no placeholder) return that
-// entry. Multi-credential endpoints dispatch on the agent-supplied
-// StartupMessage user field — exact match against each entry's
-// placeholder. Trailing no-placeholder entry is the fallback when no
-// placeholder matched.
-//
-// Returns nil only when the endpoint declared zero credentials.
-func pgResolveCredential(ep *config.CompiledEndpoint, agentUser string) *config.CompiledCredential {
-	if ep == nil || len(ep.Credentials) == 0 {
-		return nil
-	}
-	if len(ep.Credentials) == 1 && ep.Credentials[0].Placeholder == "" {
-		return ep.Credentials[0]
-	}
-	var fallback *config.CompiledCredential
-	for _, c := range ep.Credentials {
-		if c.Placeholder == "" {
-			fallback = c
-			continue
-		}
-		if agentUser == c.Placeholder {
-			return c
-		}
-	}
-	return fallback
 }
 
 // pgWriteError sends an ErrorResponse during the pre-auth phase

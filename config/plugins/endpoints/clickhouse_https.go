@@ -6,25 +6,22 @@ package endpoints
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/denoland/clawpatrol/config"
+	"github.com/denoland/clawpatrol/config/runtime"
 )
 
 // ClickhouseHTTPSEndpoint is part of the clawpatrol plugin API.
-//
-// Database, when set, restricts this endpoint to requests whose
-// agent-declared database (the `database` URL query parameter or
-// `X-ClickHouse-Database` header, query wins when both are set)
-// equals the configured value. Unset = catch-all: the endpoint claims
-// every request to its host regardless of database. Specific beats
-// catch-all when both are bound to the same host.
 type ClickhouseHTTPSEndpoint struct {
-	Hosts      []string `hcl:"hosts"`
-	Database   string   `hcl:"database,optional"`
-	Credential string   `hcl:"credential,optional"`
+	Hosts          []string  `hcl:"hosts"`
+	Credential     string    `hcl:"credential,optional"`
+	CredentialsRaw cty.Value `hcl:"credentials,optional" json:"-"`
+
+	Credentials []CredentialEntry `json:"Credentials,omitempty"`
 }
 
 // EndpointHosts is part of the clawpatrol plugin API.
@@ -32,21 +29,62 @@ func (e *ClickhouseHTTPSEndpoint) EndpointHosts() []string { return e.Hosts }
 
 // EndpointCredentials is part of the clawpatrol plugin API.
 func (e *ClickhouseHTTPSEndpoint) EndpointCredentials() []config.CredBinding {
-	return singleBinding(e.Credential)
+	return bindings(e.Credential, e.Credentials)
 }
 
-// DispatchDatabase opts the endpoint into the compile-time
-// database-routing uniqueness check (config.DatabaseRouter).
-func (e *ClickhouseHTTPSEndpoint) DispatchDatabase() string { return e.Database }
+func (e *ClickhouseHTTPSEndpoint) credentialAndRaw() (string, cty.Value) {
+	return e.Credential, e.CredentialsRaw
+}
+func (e *ClickhouseHTTPSEndpoint) setCredentialEntries(es []CredentialEntry) { e.Credentials = es }
+
+// ClickhouseHTTPSEndpointRuntime is the per-request handler. The
+// HTTPS MITM loop in main.go runs the request through this runtime's
+// PlaceholderDetector when an endpoint has a multi-credential
+// dispatch list.
+type ClickhouseHTTPSEndpointRuntime struct{}
+
+// DetectPlaceholder scans the agent's request for a placeholder
+// substring. ClickHouse HTTPS clients put credentials in the
+// Authorization header (Basic for clickhouse-client), in the
+// `?user=` / `?password=` query params (clickhouse-server accepts
+// both), or in `X-ClickHouse-User` / `X-ClickHouse-Key` headers.
+// We scan all of them and return the first candidate found.
+func (ClickhouseHTTPSEndpointRuntime) DetectPlaceholder(req *runtime.Request, candidates []string) string {
+	if req == nil {
+		return ""
+	}
+	var hay strings.Builder
+	if req.Headers != nil {
+		hay.WriteString(req.Headers.Get("Authorization"))
+		hay.WriteByte(0)
+		hay.WriteString(basicAuthPayload(req.Headers.Get("Authorization")))
+		hay.WriteByte(0)
+		hay.WriteString(req.Headers.Get("X-ClickHouse-User"))
+		hay.WriteByte(0)
+		hay.WriteString(req.Headers.Get("X-ClickHouse-Key"))
+		hay.WriteByte(0)
+	}
+	if req.URL != nil {
+		q := req.URL.Query()
+		hay.WriteString(q.Get("user"))
+		hay.WriteByte(0)
+		hay.WriteString(q.Get("password"))
+	}
+	s := hay.String()
+	for _, c := range candidates {
+		if c != "" && strings.Contains(s, c) {
+			return c
+		}
+	}
+	return ""
+}
 
 // ClickhouseHTTPSDatabaseFromRequest extracts the agent-declared
 // database from a ClickHouse HTTPS request. ClickHouse accepts the
 // target database two ways: the `database` URL query parameter or
 // the `X-ClickHouse-Database` header; the query parameter takes
 // precedence when both are set, mirroring clickhouse-server's own
-// resolution order. Returns "" when neither is set; the matcher
-// then sees an empty `sql.database`, which won't satisfy a
-// `sql.database == "..."` predicate.
+// resolution order. Returns "" when neither is set.
 func ClickhouseHTTPSDatabaseFromRequest(req *http.Request) string {
 	if req == nil {
 		return ""
@@ -64,57 +102,21 @@ func ClickhouseHTTPSDatabaseFromRequest(req *http.Request) string {
 	return ""
 }
 
-// PickClickhouseHTTPSEndpointByDatabase chooses an endpoint from a
-// set of clickhouse_https candidates whose Database fields disagree.
-// Precedence: a candidate whose Database matches db exactly wins
-// over a catch-all (Database == ""). When no specific candidate
-// matches, the catch-all is returned. Returns nil only when the
-// input is empty.
-//
-// Callers — once the HTTPS MITM request loop wires
-// clickhouse_https endpoints — pass every endpoint that claims the
-// SNI'd host (typically from a per-host candidate list built at
-// policy compile time) and the request's database, computed via
-// ClickhouseHTTPSDatabaseFromRequest.
-func PickClickhouseHTTPSEndpointByDatabase(candidates []*ClickhouseHTTPSEndpoint, db string) *ClickhouseHTTPSEndpoint {
-	if len(candidates) == 0 {
-		return nil
-	}
-	var catchAll *ClickhouseHTTPSEndpoint
-	for _, c := range candidates {
-		if c == nil {
-			continue
-		}
-		if c.Database == "" {
-			if catchAll == nil {
-				catchAll = c
-			}
-			continue
-		}
-		if c.Database == db {
-			return c
-		}
-	}
-	return catchAll
-}
-
 func init() {
+	var _ runtime.PlaceholderDetector = ClickhouseHTTPSEndpointRuntime{}
 	config.Register(&config.Plugin{
-		Kind:   config.KindEndpoint,
-		Type:   "clickhouse_https",
-		Family: "sql",
-		New:    func() any { return &ClickhouseHTTPSEndpoint{} },
-		Refs:   singularRef,
-		Build:  passthroughBuild,
+		Kind:     config.KindEndpoint,
+		Type:     "clickhouse_https",
+		Family:   "sql",
+		New:      func() any { return &ClickhouseHTTPSEndpoint{} },
+		Refs:     singularRef,
+		Runtime:  ClickhouseHTTPSEndpointRuntime{},
+		Validate: multiCredValidate,
+		Build:    passthroughBuild,
 		Emit: func(body any, _ string, b *hclwrite.Body) {
 			e := body.(*ClickhouseHTTPSEndpoint)
 			b.SetAttributeValue("hosts", config.StringListVal(e.Hosts))
-			if e.Database != "" {
-				b.SetAttributeValue("database", cty.StringVal(e.Database))
-			}
-			if e.Credential != "" {
-				config.SetIdent(b, "credential", e.Credential)
-			}
+			emitCredentialBinding(b, e.Credential, e.Credentials, "placeholder")
 		},
 	})
 }
