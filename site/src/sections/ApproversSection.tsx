@@ -1,6 +1,8 @@
 import type { ComponentChildren } from "preact";
 import { HclCode } from "../components/HclCode";
 import { SectionLabel } from "../components/SectionLabel";
+import { snippet } from "../lib/example";
+import { approver_human, approver_llm } from "../lib/examples";
 
 /* ──────────────────────────────────────────────────────────────────────
    Approvers — deepens the `require_llm` and `require_human` verdicts
@@ -14,18 +16,8 @@ import { SectionLabel } from "../components/SectionLabel";
         for both: incoming → response → verdict pill
    ──────────────────────────────────────────────────────────────────── */
 
-const LLM_CONFIG = `approver "llm_approver" "secret-judge" {
-  model       = "claude-haiku-4-5"
-  policy      = "reject changes with bad words"
-  cache_ttl   = 300
-  fail_closed = true
-}`;
-
-const HUMAN_CONFIG = `approver "human_approver" "ops" {
-  channel    = "#agent-ops"
-  timeout    = 600
-  on_timeout = "deny"
-}`;
+const LLM_CONFIG = snippet(approver_llm);
+const HUMAN_CONFIG = snippet(approver_human);
 
 /* ── Shared diagram primitives ─────────────────────────────────────── */
 
