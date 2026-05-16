@@ -10,13 +10,13 @@ export function FlowDiagram() {
       role="img"
       aria-label="Many agents on the bottom send requests through Claw Patrol to many destinations on top"
     >
-      <InternetNode />
+      <ProductionNode />
 
       <Riser />
 
       <CenterNode
         label="Claw Patrol"
-        sub="rules · approvals · credentials"
+        sub="rules · approvals · credentials · analytics"
       />
 
       <Risers count={4} />
@@ -25,7 +25,7 @@ export function FlowDiagram() {
         <Card name="Claude" icon="/icons/anthropic.svg" />
         <Card name="Codex" icon="/icons/openai.svg" />
         <Card name="OpenClaw" icon="/icons/openclaw.svg" />
-        <Card name="Other agents" />
+        <Card name="Others" />
       </CardRow>
     </div>
   );
@@ -39,20 +39,20 @@ function CardRow({ children }: { children: ComponentChildren }) {
   );
 }
 
-function InternetNode() {
+function ProductionNode() {
   return (
     <div
       class="squircle-md w-full bg-canvas border border-navy-200
         text-text px-5 py-5 text-center"
     >
       <div class="font-display font-bold text-xl leading-none">
-        The Internet
+        Production
       </div>
       <div
         class="font-mono text-[11px] uppercase tracking-wider mt-2
           text-text-muted text-balance"
       >
-        stripe · postgres · clickhouse · slack · internal apis · …
+        postgres · clickhouse · k8s · aws · gcp · github · slack · notion · …
       </div>
     </div>
   );
@@ -162,17 +162,22 @@ function Risers({ count }: { count: number }) {
 }
 
 function CenterNode({ label, sub }: { label: string; sub: string }) {
-  // The proxy. Navy surface and centered type carry the emphasis;
-  // no icon needed.
+  // Light surface keyed to the header's bg-navy-100 so the proxy node
+  // reads as the same brand surface; full Claw Patrol logo (icon +
+  // wordmark) is the same public asset the header uses.
   return (
     <div
-      class="squircle-md w-full bg-navy text-canvas border border-navy
+      class="squircle-md w-full bg-navy-100 text-text border border-navy
         px-5 py-5 text-center"
     >
-      <div class="font-display font-bold text-xl leading-none">{label}</div>
+      <img
+        src="/claw-patrol-logo.svg"
+        alt={label}
+        class="h-8 sm:h-10 w-auto mx-auto"
+      />
       <div
         class="font-mono text-[11px] uppercase tracking-wider mt-2
-          text-canvas/65"
+          text-text-muted"
       >
         {sub}
       </div>

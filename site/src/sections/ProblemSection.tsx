@@ -2,28 +2,30 @@ import { SectionLabel } from "../components/SectionLabel";
 
 const PROBLEMS = [
   {
-    title: "Agents are stuck without access",
+    title: "Granting access doesn't gate actions",
     body:
-      "An agent that can only edit files in a sandbox is a toy. The " +
-      "work that matters — running a migration, replying to a " +
-      "customer, fixing a deploy — lives behind API calls. But every " +
-      "credential you hand the agent is one you've given away.",
+      "OAuth scopes, API keys, IAM roles, k8s RBAC: every " +
+      "service has its own access model, and configuring each " +
+      "correctly is its own project. Even when you get it right, " +
+      "a prompt-injected agent will exploit whatever access you " +
+      "granted.",
   },
   {
-    title: "Prompt injection turns every input into instructions",
+    title: "Your agent shouldn't see secrets",
     body:
-      "Tool outputs, RAG hits, MCP responses, file contents the agent " +
-      "reads — any of it can hide instructions the model will follow. " +
-      "You can't audit the model's intent. The only thing you can " +
-      "constrain is what leaves the machine.",
+      "Every API key in the agent's env is one you've handed " +
+      "over. If the process is compromised (and prompts can " +
+      "compromise it), the keys leak with it. Rotation is hard, " +
+      "and you can't easily revoke a single action's worth of " +
+      "access.",
   },
   {
-    title: "Today's options are no-access or YOLO",
+    title: "Logs don't capture the action",
     body:
-      "API keys in env vars, broad OAuth scopes, no checkpoint " +
-      "between intent and damage. By the time you notice the agent " +
-      "ran DROP TABLE on prod, the table is gone — and you have no " +
-      "record of who decided what.",
+      "Reconstructing what an agent did means stitching together " +
+      "per-service logs, which usually don't capture the actual " +
+      "request payload. And by the time you notice the bad " +
+      "action, it's already gone through.",
   },
 ];
 
@@ -35,7 +37,7 @@ export function ProblemSection() {
         {PROBLEMS.map(({ title, body }, i) => (
           <div key={title} class="grid grid-cols-[auto_1fr] gap-3 sm:gap-6">
             <div class="flex items-center justify-center min-w-10 sm:min-w-16">
-              <span class="text-5xl sm:text-7xl font-bold font-display  select-none text-rust">
+              <span class="text-5xl sm:text-7xl font-bold font-display select-none text-rust">
                 {i + 1}
               </span>
             </div>
@@ -43,7 +45,7 @@ export function ProblemSection() {
               <h3 class="text-2xl sm:text-3xl font-display font-bold text-console-dark mb-3">
                 {title}
               </h3>
-              <p class="text-base  text-text-muted">{body}</p>
+              <p class="text-base text-text-muted">{body}</p>
             </div>
           </div>
         ))}

@@ -1,5 +1,6 @@
 import { FlowDiagram } from "../components/FlowDiagram";
 import { InstallTerminal } from "../components/InstallTerminal";
+import { HERO_H1 } from "../copy";
 
 export function HeroSection() {
   return (
@@ -15,20 +16,25 @@ export function HeroSection() {
           <h1
             class="text-4xl sm:text-5xl md:text-6xl md:text-[4rem]
               font-bold
-               mb-8 font-display text-balance
+               mb-4 font-display text-balance
               text-text"
           >
-            Let your agents into production.
+            {HERO_H1}
           </h1>
+          <p
+            class="text-xl sm:text-2xl mb-6 max-w-lg font-display
+            font-semibold text-text text-balance"
+          >
+            Give your agents read access to any service. Gate the writes.
+          </p>
           <p
             class="mb-10 max-w-lg
             text-text-muted"
           >
-            An agent stuck in a sandbox is a toy. Handing it your prod keys is reckless. Claw Patrol
-            sits at the only universal checkpoint — the network — between your agents and real
-            systems. Every outbound action runs against rules you write in HCL. Risky ones get a
-            human in Slack or an LLM judge. Secrets live in the proxy, not the agent. Works with
-            Claude Code, Codex, or any agent — no code changes.
+            You write the rules. Plugins parse each protocol (SQL, Kubernetes, HTTPS, SSH, …) so they
+            can match on semantics, not URLs: block <code>DROP TABLE</code>, require human approval
+            for <code>kubectl delete pod</code>, or have an LLM judge whether a{" "}
+            <code>SELECT</code> leaks secrets. Secrets stay in the proxy, never the agent.
           </p>
           <InstallTerminal />
         </div>
