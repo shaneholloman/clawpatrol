@@ -5,8 +5,6 @@ import { ApproversSection } from "./sections/ApproversSection";
 import { ComparisonSection } from "./sections/ComparisonSection";
 import { CtaSection } from "./sections/CtaSection";
 import { HeroSection } from "./sections/HeroSection";
-import { HowItWorksSection } from "./sections/HowItWorksSection";
-import { IntegrationsSection } from "./sections/IntegrationsSection";
 import { ProblemSection } from "./sections/ProblemSection";
 import { ProtocolDepthSection } from "./sections/ProtocolDepthSection";
 import { RulesSection } from "./sections/RulesSection";
@@ -24,10 +22,8 @@ export function Landing() {
         bottomColor="var(--color-navy-600)"
       />
       <ProtocolDepthSection />
-      <HowItWorksSection />
       <AnalyticsSection />
       <ComparisonSection />
-      <IntegrationsSection />
       <CtaSection />
     </Layout>
   );
