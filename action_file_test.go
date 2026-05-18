@@ -118,11 +118,11 @@ func TestFixtureSQLStrictAgainstParser(t *testing.T) {
 	}
 	// Fake parser: pretends the statement is `SELECT count(*) FROM users`
 	// regardless of input, so the assertions below have a known truth.
-	parser := func(string) any {
+	parser := func(string) (any, bool) {
 		return &sqlfacet.Meta{
 			Verb: "select", Tables: []string{"users"},
 			Functions: []string{"count"}, Statement: "stub",
-		}
+		}, false
 	}
 
 	cases := []struct {

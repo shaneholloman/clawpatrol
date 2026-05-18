@@ -896,8 +896,12 @@ func chRewindReader(head []byte, tail *chgoproto.Reader) *chgoproto.Reader {
 // based on the database the agent is leaving, not the one it's
 // entering. The new value only enters circulation on the next
 // statement.
+//
+// unparseable propagates onto match.Request so the dispatcher's
+// fail-closed-on-Unparseable gate auto-denies any rule reading
+// verb / tables / functions for a query the parser refused.
 func chEvaluateSQL(ctx context.Context, ch *runtime.ConnHandle, sql, credName, database string, truncated bool) (verdict, reason, nextDB string) {
-	info := parseChSQL(sql)
+	info, unparseable := parseChSQL(sql)
 	defer func() {
 		// Allow paths surface the USE target; deny paths leave nextDB
 		// empty because the upstream never sees the statement and the
@@ -919,7 +923,8 @@ func chEvaluateSQL(ctx context.Context, ch *runtime.ConnHandle, sql, credName, d
 			Statement: info.Statement,
 			Database:  database,
 		},
-		Truncated: truncated,
+		Truncated:   truncated,
+		Unparseable: unparseable,
 	}
 	var facets map[string]any
 	if f := facet.Lookup("sql"); f != nil {

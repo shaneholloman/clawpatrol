@@ -296,9 +296,13 @@ func stripPort(s string) string {
 
 // ToMatchRequest builds the match.Request the rule engine sees.
 // For SQL fixtures with only `statement` set, parseSQL is called
-// to derive verb / tables / function. Explicit fields on the
-// fixture take precedence over derivation.
-func (f *Fixture) ToMatchRequest(family string, parseSQL func(string) any) (*match.Request, error) {
+// to derive verb / tables / function plus the unparseable flag.
+// Explicit fields on the fixture take precedence over derivation;
+// the unparseable flag is propagated to match.Request.Unparseable
+// only when no explicit verb/tables/functions override the parser
+// (since an explicit override means the fixture author was telling
+// us the facets, regardless of what the parser thought).
+func (f *Fixture) ToMatchRequest(family string, parseSQL func(string) (any, bool)) (*match.Request, error) {
 	a := &f.Action
 	req := &match.Request{Family: family, Credential: a.Credential, PeerIP: a.PeerIP}
 	switch {
@@ -337,28 +341,51 @@ func (f *Fixture) ToMatchRequest(family string, parseSQL func(string) any) (*mat
 		// evaluator would silently see a fiction. database isn't
 		// in the statement (PG StartupMessage / CH session), so it
 		// stays a fixture-provided override.
-		meta := parseSQL(stmt)
+		//
+		// When the parser couldn't extract a facet (unparseable
+		// statement, or the parser produced no value for that
+		// facet) a fixture override fills it in instead of
+		// requiring agreement: the fixture is then asserting what
+		// the parser failed to derive, which also clears the
+		// unparseable flag for the rule evaluator.
+		meta, unparseable := parseSQL(stmt)
 		if m, ok := meta.(*sqlfacet.Meta); ok {
-			if a.SQL.Verb != "" && !strings.EqualFold(a.SQL.Verb, m.Verb) {
-				return nil, fmt.Errorf(
-					"sql.verb mismatch: fixture=%q parser=%q (statement=%q)",
-					a.SQL.Verb, m.Verb, stmt)
+			if a.SQL.Verb != "" {
+				if m.Verb == "" {
+					m.Verb = a.SQL.Verb
+					unparseable = false
+				} else if !strings.EqualFold(a.SQL.Verb, m.Verb) {
+					return nil, fmt.Errorf(
+						"sql.verb mismatch: fixture=%q parser=%q (statement=%q)",
+						a.SQL.Verb, m.Verb, stmt)
+				}
 			}
-			if len(a.SQL.Tables) > 0 && !sameStringSet(a.SQL.Tables, m.Tables) {
-				return nil, fmt.Errorf(
-					"sql.tables mismatch: fixture=%v parser=%v (statement=%q)",
-					a.SQL.Tables, m.Tables, stmt)
+			if len(a.SQL.Tables) > 0 {
+				if len(m.Tables) == 0 {
+					m.Tables = a.SQL.Tables
+					unparseable = false
+				} else if !sameStringSet(a.SQL.Tables, m.Tables) {
+					return nil, fmt.Errorf(
+						"sql.tables mismatch: fixture=%v parser=%v (statement=%q)",
+						a.SQL.Tables, m.Tables, stmt)
+				}
 			}
-			if len(a.SQL.Functions) > 0 && !sameStringSet(a.SQL.Functions, m.Functions) {
-				return nil, fmt.Errorf(
-					"sql.functions mismatch: fixture=%v parser=%v (statement=%q)",
-					a.SQL.Functions, m.Functions, stmt)
+			if len(a.SQL.Functions) > 0 {
+				if len(m.Functions) == 0 {
+					m.Functions = a.SQL.Functions
+					unparseable = false
+				} else if !sameStringSet(a.SQL.Functions, m.Functions) {
+					return nil, fmt.Errorf(
+						"sql.functions mismatch: fixture=%v parser=%v (statement=%q)",
+						a.SQL.Functions, m.Functions, stmt)
+				}
 			}
 			if a.SQL.Database != "" {
 				m.Database = a.SQL.Database
 			}
 		}
 		req.Meta = meta
+		req.Unparseable = unparseable
 	}
 	return req, nil
 }
