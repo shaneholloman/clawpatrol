@@ -329,6 +329,92 @@ default-deny. Add a `priority = -100, verdict = "deny"` catch-all
 per endpoint to invert this.
 
 
+## Inspection-buffer overflow
+
+To bound memory, the wire endpoints cap how much of each request they
+buffer for the matcher. A request that exceeds its cap is **not**
+dropped on the floor — the frame still forwards to upstream
+byte-for-byte. What's bounded is the matcher's view of it: the
+endpoint truncates the buffered slice and flags the request as
+truncated. The facet fields that draw their value from this slice
+are **truncatable facet fields** (listed per-endpoint in the table
+below). When a rule's CEL reads a truncatable facet field on a
+request that was flagged truncated, the rule is automatically
+matched without comparing the matching values, and the dispatcher
+returns a deny verdict for it.
+
+| Endpoint | Inspected slice | Cap | Truncatable facet fields |
+|----------|-----------------|-----|--------------------|
+| `https` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | `http.body`, `http.body_json` |
+| `kubernetes` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | *(none — every `k8s.*` facet is derived from the URL and method)* |
+| `clickhouse_https` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
+| `postgres` | `Query` (`Q`) and `Parse` (`P`) frame | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
+| `clickhouse_native` | `Query` packet body | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
+
+The caps are per-plugin constants in the gateway source — **not
+operator-tunable** today, and not surfaced in `gateway.hcl`. Header
+and URL bytes are bounded separately by `net/http`'s defaults and
+aren't covered here; the `ssh` endpoint has no rule family, so no
+inspection cap.
+
+### Rule matching semantics on truncated fields
+
+When a request overflows its cap, the dispatcher walks the endpoint's
+rules in priority order as usual. For each rule:
+
+- **Catch-all rule** (no `condition`): fires as written. A truncated
+  body can't poison a rule that reads nothing.
+- **Rule whose CEL reads no truncatable facet field** (e.g.
+  `http.method == 'GET'`, `credential = X`, any `k8s.*` predicate):
+  the matcher runs normally — the truncated bytes are irrelevant to
+  its decision.
+- **Rule whose CEL reads a truncatable facet field**: the rule is
+  automatically matched without comparing the matching values. The
+  dispatcher synthesizes a deny attributed to that rule, with this
+  exact reason:
+
+  ```
+  rule "<name>" reads a request facet whose bytes were truncated by the gateway's inspection buffer; failing closed
+  ```
+
+  The synthesized rule keeps the original rule's name and priority,
+  so logs and dashboards still attribute the deny to the rule whose
+  contract the truncation broke.
+
+The upshot: a rule matching on `http.method` and/or `credential` on
+an `https` endpoint still fires on a 2 MiB body, but a
+`http.body_json.field == "x"` rule auto-denies.
+
+A matched rule with `approve = [...]` on a truncated postgres frame
+is forced to deny without paging the approver (HITL can't reason about
+bytes that aren't there); the postgres endpoint surfaces this with the
+reason `"approval required but request was truncated by inspection
+buffer"`.
+
+### How the deny reaches the agent
+
+Each protocol synthesizes the deny in its native shape so the agent's
+driver doesn't disconnect:
+
+- **`https`, `kubernetes`, `clickhouse_https`** — `HTTP/1.1 403
+  Forbidden`, `Content-Type: text/plain`, reason in the body,
+  `Connection: close`.
+- **`postgres`** — `ErrorResponse` (severity `ERROR`, SQLSTATE
+  `42501`, message = reason), followed by `ReadyForQuery` in idle
+  state. The session stays open; the agent can run the next query.
+- **`clickhouse_native`** — server `Exception` packet with the
+  reason. The unread tail of the oversize `Query` body is drained off
+  the wire so the next packet frames correctly.
+
+### Why fail-closed
+
+A truncated body might contain content that *would* have triggered a
+deny rule the gateway can't see, so refusing is the safe default. If
+legitimate traffic is expected to exceed the cap, write the rules
+against non-truncatable facet fields only (see the table above) — those
+rules still match on a truncated request and won't auto-deny.
+
+
 ## Examples
 
 ### Allow / deny pair (HTTP)
