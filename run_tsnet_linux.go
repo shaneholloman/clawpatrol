@@ -41,19 +41,18 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -199,7 +198,7 @@ func runRunTsnet(args []string) {
 		fail("gvisor stack: %v", err)
 	}
 	defer gvStack.Close()
-	startTunBridge(tunFile, gvEp)
+	startTunBridge(tunFile, gvEp, tsServer)
 
 	// 7. TCP forwarder: every connection → tsnet → gateway.
 	// We forward to gwHost:originalPort so the gateway can route by port
@@ -299,9 +298,7 @@ func runRunTsnetChild() {
 	}
 
 	if os.Getenv("CLAWPATROL_RUN_KEEP_RESOLV") != "1" {
-		// options use-vc forces DNS over TCP — the gVisor netstack only handles
-		// TCP, so UDP DNS queries would silently drop without this option.
-		_ = bindResolv("nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions use-vc\n")
+		_ = bindResolv("nameserver 1.1.1.1\nnameserver 8.8.8.8\n")
 	}
 
 	autoExpose := os.Getenv(runNoAutoExposeEnv) != "1"
@@ -402,9 +399,12 @@ func (b *tsnetTunBridge) WriteNotify() {
 
 // startTunBridge registers the outbound notification and starts the
 // inbound read loop (TUN fd → gVisor InjectInbound).
-func startTunBridge(tunFile *os.File, ep *channel.Endpoint) {
+// IPv4 UDP packets are intercepted before gVisor injection and forwarded
+// directly via tsnet so the child has functional UDP without an exit node.
+func startTunBridge(tunFile *os.File, ep *channel.Endpoint, ts *tsnet.Server) {
 	br := &tsnetTunBridge{tunFile: tunFile, ep: ep}
 	ep.AddNotify(br)
+	uf := &udpForwarder{ts: ts, tunFile: tunFile, flows: map[udpFlowKey]net.Conn{}}
 
 	go func() {
 		buf := make([]byte, tunMTU)
@@ -418,6 +418,11 @@ func startTunBridge(tunFile *os.File, ep *channel.Endpoint) {
 			}
 			pkt := make([]byte, n)
 			copy(pkt, buf[:n])
+			// Intercept IPv4 UDP before injecting into gVisor TCP stack.
+			if pkt[0]>>4 == 4 && n > 20 && pkt[9] == 17 {
+				uf.handle(pkt)
+				continue
+			}
 			pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Payload: buffer.MakeWithData(pkt),
 			})
@@ -431,6 +436,113 @@ func startTunBridge(tunFile *os.File, ep *channel.Endpoint) {
 			}
 		}
 	}()
+}
+
+// udpForwarder maintains per-flow tsnet UDP connections for the child netns.
+// Each unique (srcIP:srcPort → dstIP:dstPort) 4-tuple gets one tsnet UDP conn.
+type udpForwarder struct {
+	ts      *tsnet.Server
+	tunFile *os.File
+	mu      sync.Mutex
+	flows   map[udpFlowKey]net.Conn
+}
+
+type udpFlowKey struct {
+	srcIP, dstIP     [4]byte
+	srcPort, dstPort uint16
+}
+
+func (f *udpForwarder) handle(pkt []byte) {
+	ihl := int(pkt[0]&0xf) * 4
+	if len(pkt) < ihl+8 {
+		return
+	}
+	var srcIP, dstIP [4]byte
+	copy(srcIP[:], pkt[12:16])
+	copy(dstIP[:], pkt[16:20])
+	srcPort := uint16(pkt[ihl])<<8 | uint16(pkt[ihl+1])
+	dstPort := uint16(pkt[ihl+2])<<8 | uint16(pkt[ihl+3])
+	udpLen := int(pkt[ihl+4])<<8 | int(pkt[ihl+5])
+	if udpLen < 8 || ihl+udpLen > len(pkt) {
+		return
+	}
+	payload := pkt[ihl+8 : ihl+udpLen]
+
+	key := udpFlowKey{srcIP, dstIP, srcPort, dstPort}
+
+	f.mu.Lock()
+	conn, ok := f.flows[key]
+	if !ok {
+		dstAddr := fmt.Sprintf("%d.%d.%d.%d:%d",
+			dstIP[0], dstIP[1], dstIP[2], dstIP[3], dstPort)
+		var err error
+		conn, err = f.ts.Dial(context.Background(), "udp", dstAddr)
+		if err != nil {
+			f.mu.Unlock()
+			return
+		}
+		f.flows[key] = conn
+		go func() {
+			f.readResponses(conn, dstIP, srcIP, dstPort, srcPort)
+			f.mu.Lock()
+			delete(f.flows, key)
+			f.mu.Unlock()
+			_ = conn.Close()
+		}()
+	}
+	f.mu.Unlock()
+
+	_, _ = conn.Write(payload)
+}
+
+func (f *udpForwarder) readResponses(conn net.Conn, srcIP, dstIP [4]byte, srcPort, dstPort uint16) {
+	buf := make([]byte, 65535)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		_, _ = f.tunFile.Write(buildUDPPacket(srcIP, dstIP, srcPort, dstPort, buf[:n]))
+	}
+}
+
+// buildUDPPacket constructs a raw IPv4+UDP packet. UDP checksum is zero
+// (optional for IPv4; Linux accepts these from TUN devices).
+func buildUDPPacket(srcIP, dstIP [4]byte, srcPort, dstPort uint16, payload []byte) []byte {
+	udpLen := 8 + len(payload)
+	ipLen := 20 + udpLen
+	pkt := make([]byte, ipLen)
+	pkt[0] = 0x45 // IPv4, IHL=5
+	pkt[2] = byte(ipLen >> 8)
+	pkt[3] = byte(ipLen)
+	pkt[8] = 64 // TTL
+	pkt[9] = 17 // UDP
+	copy(pkt[12:16], srcIP[:])
+	copy(pkt[16:20], dstIP[:])
+	cs := ipv4Checksum(pkt[:20])
+	pkt[10] = byte(cs >> 8)
+	pkt[11] = byte(cs)
+	pkt[20] = byte(srcPort >> 8)
+	pkt[21] = byte(srcPort)
+	pkt[22] = byte(dstPort >> 8)
+	pkt[23] = byte(dstPort)
+	pkt[24] = byte(udpLen >> 8)
+	pkt[25] = byte(udpLen)
+	// pkt[26:28] = 0 (checksum omitted)
+	copy(pkt[28:], payload)
+	return pkt
+}
+
+func ipv4Checksum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(b[i])<<8 | uint32(b[i+1])
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
 }
 
 // enableTsnetTCPForwarder installs a promiscuous TCP forwarder on s.
@@ -469,130 +581,4 @@ func enableTsnetTCPForwarder(s *stack.Stack, ts *tsnet.Server, gwHost, gwPort st
 		}()
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
-}
-
-// tsnetBiRelay copies bidirectionally between a and b, half-closing
-// each side when the opposite direction finishes.
-func tsnetBiRelay(a, b net.Conn) {
-	type halfCloser interface {
-		CloseWrite() error
-	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, _ = io.Copy(b, a)
-		if hc, ok := b.(halfCloser); ok {
-			_ = hc.CloseWrite()
-		} else {
-			_ = b.Close()
-		}
-	}()
-	_, _ = io.Copy(a, b)
-	if hc, ok := a.(halfCloser); ok {
-		_ = hc.CloseWrite()
-	} else {
-		_ = a.Close()
-	}
-	<-done
-}
-
-// --- tsnet helpers -------------------------------------------------------
-
-// waitTsnetUp starts the tsnet.Server and blocks until the node is Running
-// and has a 100.x.x.x IP. Returns the IPv4 tailnet address.
-func waitTsnetUp(s *tsnet.Server) (netip.Addr, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
-	// s.Up blocks until Running; the returned status already has TailscaleIPs.
-	upSt, err := s.Up(ctx)
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("tsnet up: %w", err)
-	}
-	for _, ip := range upSt.Self.TailscaleIPs {
-		if ip.Is4() {
-			return ip, nil
-		}
-	}
-	// Fallback: query LocalClient (should rarely be needed).
-	lc, err := s.LocalClient()
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("local client: %w", err)
-	}
-	lcSt, err := lc.Status(ctx)
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("status: %w", err)
-	}
-	for _, ip := range lcSt.Self.TailscaleIPs {
-		if ip.Is4() {
-			return ip, nil
-		}
-	}
-	if len(lcSt.Self.TailscaleIPs) > 0 {
-		return lcSt.Self.TailscaleIPs[0], nil
-	}
-	return netip.Addr{}, fmt.Errorf("no tailnet IPs assigned")
-}
-
-// fetchEphemeralTsnetKey calls POST /api/peer/ephemeral/tsnet on the
-// gateway to obtain a single-use ephemeral Tailscale auth key and the
-// tailnet port the gateway is listening on. gwPort defaults to "443" if
-// the gateway omits it (old gateway versions).
-func fetchEphemeralTsnetKey(gwURL, token, caPath string) (authKey, gwPort string, err error) {
-	client, ferr := gatewayHTTPClient(caPath)
-	if ferr != nil {
-		return "", "", fmt.Errorf("http client: %w", ferr)
-	}
-	req, ferr := http.NewRequest(http.MethodPost, gwURL+"/api/peer/ephemeral/tsnet", nil)
-	if ferr != nil {
-		return "", "", ferr
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, ferr := client.Do(req)
-	if ferr != nil {
-		return "", "", ferr
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return "", "", fmt.Errorf("gateway %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var result struct {
-		AuthKey     string `json:"auth_key"`
-		GatewayPort string `json:"gateway_port"`
-	}
-	if ferr := json.NewDecoder(resp.Body).Decode(&result); ferr != nil {
-		return "", "", ferr
-	}
-	if result.AuthKey == "" {
-		return "", "", fmt.Errorf("empty auth_key in response")
-	}
-	if result.GatewayPort == "" {
-		result.GatewayPort = "443"
-	}
-	return result.AuthKey, result.GatewayPort, nil
-}
-
-// registerEphemeralTsnetIP tells the gateway which 100.x.x.x tailnet IP this
-// ephemeral tsnet run session got, so the gateway maps it to the parent
-// device's profile for credential dispatch.
-func registerEphemeralTsnetIP(gwURL, token, caPath, tsIP string) error {
-	client, err := gatewayHTTPClient(caPath)
-	if err != nil {
-		return fmt.Errorf("http client: %w", err)
-	}
-	req, err := http.NewRequest(http.MethodPost, gwURL+"/api/peer/ephemeral/tsnet/register?ip="+tsIP, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		return fmt.Errorf("gateway %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return nil
 }
