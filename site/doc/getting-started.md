@@ -39,6 +39,12 @@ control        = "wireguard"
 wg_subnet_cidr = "10.55.0.0/24"
 ```
 
+(Prefer Tailscale? Swap `control` to `"tailscale"`, add `funnel =
+true`, `listen = ":8443"`, and `oauth_client_id` /
+`oauth_client_secret` / `tailscale_tags`. Embedded tsnet joins the
+tailnet in-process, no UDP port or iptables rule needed. The rest
+of this guide works the same way.)
+
 **`info_listen` should bind privately.** The dashboard holds the
 credential vault — the gateway refuses to boot when `info_listen`
 is publicly bound (`0.0.0.0`, `::`, or a routable IP) without
