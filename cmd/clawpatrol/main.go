@@ -18,11 +18,13 @@ import (
 	_ "net/http/pprof"
 	"net/netip"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/denoland/clawpatrol/cmd/clawpatrol/dnsvip"
@@ -105,6 +107,34 @@ func warnIfStateLooselyPermissioned(stateDir string) {
 	}
 	check(stateDir, 0o700)
 	check(filepath.Join(stateDir, "clawpatrol.db"), 0o600)
+}
+
+// seedAgentsFromDevices pre-populates the agent registry from the
+// persisted devices table so the dashboard renders every onboarded
+// device on boot, before any traffic arrives.
+//
+// Defined as its own function so the *sql.Rows cleanup is scoped to
+// this read instead of riding on runGateway's lifetime (i.e. process
+// lifetime). The previous in-place loop tied the pooled sql.Conn to
+// the rows handle for the entire gateway run — harmless on shutdown
+// but wasted a connection-pool slot for no reason.
+func seedAgentsFromDevices(db *sql.DB, agents *AgentRegistry) error {
+	rows, err := db.Query("SELECT id FROM devices")
+	if err != nil {
+		return fmt.Errorf("query devices: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var ip string
+		if err := rows.Scan(&ip); err != nil {
+			return fmt.Errorf("scan device row: %w", err)
+		}
+		agents.Seed(canonicalPeerIP(ip))
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate devices: %w", err)
+	}
+	return nil
 }
 
 // emit a terminal request event to both the SSE sink and OTel.
@@ -2546,10 +2576,15 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 		if ar == nil {
 			return runtime.ApproveVerdict{Decision: "deny", Reason: "approver " + st.Name + " not found", By: "gateway", ApproverName: st.Name}
 		}
+		stageCtx := ctx
+		var stageCancel context.CancelFunc = func() {}
 		if c.AsyncPendingOnSyncTimeout && c.AsyncSyncWaitTimeout > 0 && c.AsyncOperationID != "" {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, c.AsyncSyncWaitTimeout)
-			defer cancel()
+			// Per-stage timeout: scope to the iteration so cancels don't
+			// accumulate via deferred-in-loop. A long approve chain
+			// (rare but legal) previously held one CancelFunc on the
+			// defer stack per stage; releasing each stage's context as
+			// soon as the call returns keeps memory bounded.
+			stageCtx, stageCancel = context.WithTimeout(ctx, c.AsyncSyncWaitTimeout)
 		}
 		req := runtime.ApproveRequest{
 			Stage:                     st,
@@ -2575,7 +2610,8 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			MessageUpdateSink:         g.recordHITLOperationMessageRef,
 			PendingMessageUpdateSink:  g.hitl.RecordMessageRef,
 		}
-		v, err := ar.Approve(ctx, req)
+		v, err := ar.Approve(stageCtx, req)
+		stageCancel()
 		// Stamp the entity name + plugin type on every verdict so the
 		// dispatcher labels its `approved` / `denied` events with the
 		// deciding approver — runtimes don't have to remember.
@@ -2756,6 +2792,23 @@ Start from the example config:
 HCL reference:
   https://clawpatrol.dev/docs/config-reference`
 
+// runGateway is the entry point for the `clawpatrol gateway` subcommand.
+//
+// Exit-site discipline:
+//   - usage errors (bad/missing config path) use `os.Exit(2)` — the
+//     flag package's convention for "invalid invocation".
+//   - boot-time failures that leave the gateway in an unusable state
+//     (config parse, state-dir create, DB open, CA load, sink init,
+//     OAuth registry init, dnsvip init, onboard load, WG init,
+//     listener bind) use `log.Fatalf` — there's no usable partial
+//     state to recover into, and dragging the process forward only
+//     hides the root cause in later errors.
+//   - SIGINT / SIGTERM is the clean-exit path: installGatewayShutdown
+//     flushes telemetry + closes the DB, then `os.Exit(0)`.
+//
+// The retained Fatal sites are deliberate; do not "clean them up" into
+// `return err` without owning the new contract for what the caller is
+// supposed to do with a half-initialized gateway.
 func runGateway(args []string) {
 	fs := flag.NewFlagSet("gateway", flag.ExitOnError)
 	setDashboardPassword := fs.String("set-dashboard-password", "",
@@ -2868,18 +2921,11 @@ func runGateway(args []string) {
 	// Clean fd77:: ghost rows (WG) and fd7a:: ghost rows (Tailscale IPv6)
 	// left by builds that upserted IPv6 peer addresses as separate device
 	// IDs. Drop them on every boot — the v4 row carries the same metadata.
-	_, _ = db.Exec("DELETE FROM devices WHERE id LIKE 'fd77:%' OR id LIKE 'fd7a:%'")
-	if rows, err := db.Query("SELECT id FROM devices"); err == nil {
-		defer func() { _ = rows.Close() }()
-		for rows.Next() {
-			var ip string
-			if rows.Scan(&ip) == nil {
-				g.agents.Seed(canonicalPeerIP(ip))
-			}
-		}
-		if err := rows.Err(); err != nil {
-			log.Printf("seed devices: %v", err)
-		}
+	if _, err := db.Exec("DELETE FROM devices WHERE id LIKE 'fd77:%' OR id LIKE 'fd7a:%'"); err != nil {
+		log.Printf("gateway: prune ghost device rows: %v", err)
+	}
+	if err := seedAgentsFromDevices(db, g.agents); err != nil {
+		log.Printf("gateway: seed agents from devices: %v", err)
 	}
 
 	// Sessions: rehydrate persisted rows + start the sweeper.
@@ -2894,11 +2940,21 @@ func runGateway(args []string) {
 	// (config/plugins/approvers); the registry's Add hook emits
 	// the SSE event for the dashboard.
 
-	if _, err := StartOtel(g); err != nil {
+	otelShutdown, err := StartOtel(g)
+	if err != nil {
 		log.Printf("otel: %v", err)
 	}
 
 	startTelemetry(g)
+
+	// Graceful-shutdown handler. SIGINT / SIGTERM flushes telemetry
+	// (so traces / metrics buffered in BatchSpanProcessor don't get
+	// dropped at process exit) and closes the SQLite handle (so WAL
+	// checkpointing finishes before the file descriptor goes away).
+	// The listen loop below blocks runGateway, so the goroutine
+	// terminates via os.Exit — preserves the daemon-style single-
+	// exit-site discipline (the loop never returns).
+	installGatewayShutdown(g, otelShutdown)
 
 	seedHook.Run(context.Background(), g)
 
@@ -3164,6 +3220,91 @@ func serveHTTPLogged(name, addr string, handler http.Handler) {
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		logHTTPServerExit(name, addr, err)
 	}
+}
+
+// installGatewayShutdown spawns a goroutine that waits for SIGINT or
+// SIGTERM, flushes telemetry, drains the action sink, closes tunnels
+// and the DB handle, then exits the process. otelShutdown may be nil
+// when otel was not configured.
+//
+// Why a goroutine + os.Exit rather than threading shutdown back into
+// runGateway: the gateway's main accept loop (ln.Accept inside
+// runGateway) is intentionally infinite — letting it return would
+// drop any pending sweeper / config-watch / sink-drain goroutines on
+// the floor without their own cleanup. The signal handler is the
+// single exit site; everything that needs to flush hooks into it.
+//
+// Best-effort: each step has its own budget so one wedged collaborator
+// can't block the rest. Order is load-bearing — Sink.Close has to
+// drain into the DB before db.Close, and TunnelManager.CloseAll has
+// to run while goroutines still have a chance to react (Tailscale
+// logout in particular wants a live tsnet.Server).
+const (
+	gatewayOtelShutdownTimeout   = 5 * time.Second
+	gatewaySinkShutdownTimeout   = 5 * time.Second
+	gatewayTunnelShutdownTimeout = 5 * time.Second
+)
+
+func installGatewayShutdown(g *Gateway, otelShutdown func(context.Context) error) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("gateway: received %s, shutting down", sig)
+		runGatewayShutdown(g, otelShutdown)
+		log.Printf("gateway: shutdown complete")
+		os.Exit(0)
+	}()
+}
+
+// runGatewayShutdown executes the shutdown sequence in dependency
+// order. Extracted from the signal-handler goroutine so the order is
+// testable without the surrounding os.Exit wrapper. Each step is
+// best-effort: any single failure logs and moves on so a wedged
+// collaborator can't strand WAL checkpointing.
+func runGatewayShutdown(g *Gateway, otelShutdown func(context.Context) error) {
+	runShutdownFlush(otelShutdown, gatewayOtelShutdownTimeout)
+	if g != nil && g.sink != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), gatewaySinkShutdownTimeout)
+		if err := g.sink.Close(ctx); err != nil {
+			log.Printf("gateway: sink drain: %v", err)
+		}
+		cancel()
+	}
+	if g != nil && g.tunnels != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), gatewayTunnelShutdownTimeout)
+		if err := g.tunnels.CloseAll(ctx); err != nil {
+			log.Printf("gateway: tunnel close: %v", err)
+		}
+		cancel()
+	}
+	if g != nil && g.db != nil {
+		if err := g.db.Close(); err != nil {
+			log.Printf("gateway: db close: %v", err)
+		}
+	}
+}
+
+// runShutdownFlush invokes the otel shutdown closure (when non-nil)
+// under a bounded context, logging any error. Split out from
+// installGatewayShutdown so the timeout-and-error contract is testable
+// without the surrounding signal / os.Exit wrapper.
+func runShutdownFlush(otelShutdown func(context.Context) error, timeout time.Duration) {
+	if err := runShutdownFlushErr(otelShutdown, timeout); err != nil {
+		log.Printf("gateway: otel shutdown: %v", err)
+	}
+}
+
+// runShutdownFlushErr is the pure variant: returns the flush error
+// instead of logging it. Used by tests; the production wrapper above
+// pipes the error to the log.
+func runShutdownFlushErr(otelShutdown func(context.Context) error, timeout time.Duration) error {
+	if otelShutdown == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return otelShutdown(ctx)
 }
 
 func logHTTPServerExit(name, addr string, err error) {

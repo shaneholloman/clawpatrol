@@ -467,6 +467,7 @@ func (r *AgentRegistry) LoadSessions(db *sql.DB) {
 			ti, to, cu, cm, reqs, fa, la int64
 		)
 		if err := rows.Scan(&ip, &t, &id, &title, &model, &ti, &to, &cu, &cm, &reqs, &fa, &la); err != nil {
+			log.Printf("sessions: scan row: %v", err)
 			continue
 		}
 		if r.onboard != nil && !r.onboard.HasDevice(ip) {
@@ -525,7 +526,15 @@ func (r *AgentRegistry) startSessionSweeper(keep time.Duration) {
 func (r *AgentRegistry) sweepSessions(keep time.Duration) {
 	cutoffT := time.Now().Add(-keep)
 	cutoff := cutoffT.UnixNano()
-	_, _ = r.db.Exec(`DELETE FROM sessions WHERE last_at < ?`, cutoff)
+	// Surface the delete error so a silently-failing sweep (e.g. WAL
+	// checkpoint contention dragging on past busy_timeout, or a
+	// schema-incompatible row blocking the index walk) doesn't accrete
+	// unbounded session history without anyone noticing. The in-memory
+	// trim below still runs on error so the dashboard's view at least
+	// rolls forward — the next tick will retry the delete.
+	if _, err := r.db.Exec(`DELETE FROM sessions WHERE last_at < ?`, cutoff); err != nil {
+		log.Printf("sessions: sweep delete: %v", err)
+	}
 	// Trim in-memory slices too. Without this the dashboard keeps
 	// showing rows the DB no longer has — apiAgents reads from
 	// snapshot(), not from the DB. Single pass under the registry
