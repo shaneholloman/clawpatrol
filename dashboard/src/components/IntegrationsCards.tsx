@@ -36,9 +36,13 @@ export function IntegrationsCards({
   const [editing, setEditing] = useState<Integration | null>(null);
   const [allOpen, setAllOpen] = useState(false);
 
+  // Passthrough credentials inject nothing and have no connect flow —
+  // there's no operator action to take on them, so they get no card.
+  const cards = list.filter((i) => !i.passthrough);
+
   // Sort: connected first, then unconnected, then disabled (no auth
   // path) — preserves declaration order within each bucket.
-  const sorted = [...list].sort((a, b) => {
+  const sorted = [...cards].sort((a, b) => {
     const score = (i: Integration) => {
       if (i.connected || i.tailscale_auth?.connected) return 0;
       if (i.has_oauth || i.has_tailscale_auth || (i.slots && i.slots.length > 0)) return 1;

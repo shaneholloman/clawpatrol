@@ -144,7 +144,10 @@ export function CredentialsTypeGrid({
   const containerRef = useRef<HTMLDivElement>(null);
   const cols = useColumnCount(containerRef);
 
-  const groups = groupByType(list);
+  // Passthrough credentials inject nothing and have no connect flow —
+  // there's no operator action to take on them, so they get no card
+  // (and thus no type roll-up or details row) here.
+  const groups = groupByType(list.filter((i) => !i.passthrough));
 
   // Drop the active type if it disappears from the list (e.g. a
   // reload removed every credential of that type).
