@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
 import {
+  applyGeneratedRule,
   downloadActionFixture,
   getAction,
+  previewRuleFromAction,
   type Agent,
   type EventRecord,
   type FacetSchema,
+  type RulePreview,
 } from "../lib/api";
 import { headersToJSON } from "../lib/clipboard";
 import { formatFacetValue, useFacets } from "../lib/facets";
@@ -13,6 +16,7 @@ import { Button } from "./Button";
 import { CopyButton } from "./CopyButton";
 import { ApprovalStatusIcon, LockGlyph } from "./LiveRequests";
 import { Main } from "./Main";
+import { Modal } from "./Modal";
 import { PageTitle, type Crumb } from "./PageTitle";
 import { Tag } from "./Tag";
 
@@ -130,7 +134,7 @@ export function RequestDetailPage({ id, agents }: { id: string; agents: Agent[] 
             {fullUrl}
           </span>
           <span className="ml-auto">
-            <DownloadActionButton ev={ev} />
+            <ActionButtons ev={ev} />
           </span>
         </div>
         <div className="flex items-center gap-4 text-xs text-text-muted flex-wrap">
@@ -214,6 +218,22 @@ export function RequestDetailPage({ id, agents }: { id: string; agents: Agent[] 
   );
 }
 
+function ActionButtons({ ev }: { ev: EventRecord }) {
+  const [ruleOpen, setRuleOpen] = useState(false);
+  const canBlock = !!ev.id && ev.action !== "in_flight" && (!!ev.endpoint || ev.mode === "splice");
+  return (
+    <div className="flex items-center gap-2 flex-wrap justify-end">
+      {canBlock && (
+        <Button variant="outline" onClick={() => setRuleOpen(true)}>
+          Block requests like this
+        </Button>
+      )}
+      <DownloadActionButton ev={ev} />
+      {ruleOpen && <RulePreviewModal ev={ev} onClose={() => setRuleOpen(false)} />}
+    </div>
+  );
+}
+
 // DownloadActionButton triggers a server-side reshape of this event
 // into a `clawpatrol test` fixture and saves it as a .json file. The
 // runner reads files in this exact format — drop the download into a
@@ -234,14 +254,7 @@ function DownloadActionButton({ ev }: { ev: EventRecord }) {
         setErr(null);
         try {
           const blob = await downloadActionFixture(ev.id!);
-          const href = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = href;
-          a.download = `${ev.id}.json`;
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          URL.revokeObjectURL(href);
+          downloadBlob(blob, `${ev.id}.json`);
         } catch (e) {
           setErr((e as Error).message || "download failed");
         } finally {
@@ -253,6 +266,194 @@ function DownloadActionButton({ ev }: { ev: EventRecord }) {
       {busy ? "Downloading…" : "Download action"}
     </Button>
   );
+}
+
+function RulePreviewModal({ ev, onClose }: { ev: EventRecord; onClose: () => void }) {
+  const [preview, setPreview] = useState<RulePreview | null>(null);
+  const [hcl, setHCL] = useState("");
+  const [busy, setBusy] = useState(true);
+  const [applying, setApplying] = useState(false);
+  const [applied, setApplied] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!ev.id) return;
+    setBusy(true);
+    setErr(null);
+    previewRuleFromAction(ev.id)
+      .then((p) => {
+        if (cancelled) return;
+        setPreview(p);
+        setHCL(p.hcl);
+      })
+      .catch((e) => {
+        if (!cancelled) setErr((e as Error).message || "rule preview failed");
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ev.id]);
+
+  async function copyHCL() {
+    await navigator.clipboard.writeText(hcl);
+    setMsg("HCL copied.");
+  }
+
+  async function applyRule() {
+    if (!preview?.config_revision) return;
+    setApplying(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      await applyGeneratedRule(preview.config_revision, hcl);
+      setApplied(true);
+    } catch (e) {
+      const text = (e as Error).message || "apply failed";
+      if (text.includes("config changed")) {
+        setErr(
+          "The config changed since this rule was generated. Regenerate the rule and try again.",
+        );
+      } else {
+        setErr(text);
+      }
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  const writesEnabled = !!preview?.dashboard_config_writes;
+  const createsEndpoint = !!preview?.endpoint_name && preview.endpoint_name !== ev.endpoint;
+  const passthrough = createsEndpoint || ev.mode === "splice";
+
+  return (
+    <Modal title="Block requests like this" size="lg" onClose={onClose}>
+      <div className="p-4 space-y-3 overflow-auto">
+        {applied ? (
+          <div className="min-h-[300px] flex flex-col items-center justify-center text-center gap-4">
+            <div className="flex items-center justify-center w-14 h-14 rounded-full border-2 border-success-600 text-success-600">
+              <CheckLargeIcon />
+            </div>
+            <div className="space-y-2 max-w-[34rem]">
+              <h3 className="text-lg font-semibold text-text">Rule applied</h3>
+              <p className="text-sm text-text-muted">
+                The generated HCL was validated, written to disk, and reloaded by the gateway. New
+                matching requests will be denied.
+              </p>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-text-muted">
+            {passthrough
+              ? "This request was passed through without MITM inspection because no endpoint matched it. Claw Patrol generated HCL that creates an endpoint for the observed host, claims it from existing profiles via a passthrough credential, and denies future matching requests before they pass through."
+              : "Claw Patrol generated a narrow deny rule from this inspected action. Edit the condition if you want to broaden it."}
+          </p>
+        )}
+        {!applied && busy ? (
+          <div className="text-xs text-text-subtle">Generating rule...</div>
+        ) : !applied && err && !preview ? (
+          <div className="text-sm text-danger-500 whitespace-pre-wrap">{err}</div>
+        ) : !applied ? (
+          <>
+            {!writesEnabled && (
+              <div className="border border-butter-600 bg-butter-100 px-3 py-2 text-xs text-text">
+                Dashboard config writes are disabled for this gateway. Set{" "}
+                <code>dashboard_config_writes = true</code> in the{" "}
+                <a
+                  href="https://clawpatrol.dev/docs/config-reference/#gateway--"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline"
+                >
+                  gateway block
+                </a>{" "}
+                to let the dashboard apply rules directly; until then, copy this HCL into your
+                config and deploy it through your normal workflow.
+              </div>
+            )}
+            {preview?.warnings?.map((w) => (
+              <div key={w} className="border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
+                {w}
+              </div>
+            ))}
+            {createsEndpoint && (
+              <div className="border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
+                This will create endpoint <code>{preview.endpoint_name}</code> for future traffic.
+                It does not retroactively inspect this request. A passthrough credential is added so
+                existing profiles claim the endpoint; no auth is injected.
+              </div>
+            )}
+            <textarea
+              value={hcl}
+              onChange={(e) => setHCL(e.target.value)}
+              spellCheck={false}
+              className="w-full min-h-[300px] resize-y border-1.5 border-navy bg-canvas p-3 font-mono text-xs text-text outline-none focus:bg-white"
+            />
+            {err && <div className="text-sm text-danger-500 whitespace-pre-wrap">{err}</div>}
+            {msg && <div className="text-sm text-success-600">{msg}</div>}
+          </>
+        ) : null}
+      </div>
+      <div className="flex items-center gap-2 justify-end px-4 py-3 border-t border-navy bg-navy-100">
+        {applied ? (
+          <>
+            <Button variant="outline" disabled={!preview} onClick={copyHCL}>
+              Copy HCL
+            </Button>
+            <Button variant="outline" onClick={onClose}>
+              Close
+            </Button>
+          </>
+        ) : writesEnabled ? (
+          <Button disabled={!preview || applying} onClick={applyRule}>
+            {applying ? "Applying..." : "Apply rule"}
+          </Button>
+        ) : (
+          <Button disabled={!preview} onClick={copyHCL}>
+            Copy HCL
+          </Button>
+        )}
+        {!applied && writesEnabled && (
+          <Button variant="outline" disabled={!preview} onClick={copyHCL}>
+            Copy HCL
+          </Button>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function CheckLargeIcon() {
+  return (
+    <svg
+      width="28"
+      height="28"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m5 12 5 5L20 7" />
+    </svg>
+  );
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(href);
 }
 
 // --- SQL detail ---

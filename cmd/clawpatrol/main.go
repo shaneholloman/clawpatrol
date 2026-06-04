@@ -335,8 +335,13 @@ func newUpstreamDialer(resolver string) *net.Dialer {
 }
 
 type Gateway struct {
-	cfg      *config.Gateway
+	// cfg is the live operational *config.Gateway. Stored as an
+	// atomic pointer because dashboard handlers and the reload loop
+	// read it without holding configMu; configMu only serialises
+	// writes (reload + dashboard-driven apply).
+	cfg      atomic.Pointer[config.Gateway]
 	cfgPath  string // path the HCL config was loaded from
+	configMu sync.Mutex
 	stateDir string // resolved gateway state dir (sqlite + plugin blobs)
 	db       *sql.DB
 	policy   atomic.Pointer[config.CompiledPolicy]
@@ -453,7 +458,7 @@ func (g *Gateway) profileFor(peerIP string) string {
 			}
 		}
 	}
-	return defaultProfileName(g.cfg.Policy)
+	return defaultProfileName(g.cfg.Load().Policy)
 }
 
 // resolveTsnetAlias does a one-shot tsnet WhoIs for peerIP and, on a
@@ -584,31 +589,41 @@ func (g *Gateway) watchConfig(path string) {
 			continue
 		}
 		last = st.ModTime()
-		next, policy, err := loadConfig(path)
+		g.configMu.Lock()
+		err = g.reloadConfigFromFileLocked(path)
+		g.configMu.Unlock()
 		if err != nil {
 			log.Printf("config reload: %v", err)
-			continue
 		}
-		g.policy.Store(policy)
-		registerOAuthCredentials(g.oauth, policy)
-		newConnIdx := runtime.BuildConnIndex(policy)
-		g.connIdx.Store(newConnIdx)
-		if g.tunnels != nil {
-			g.tunnels.SetPolicy(context.Background(), policy)
-		}
-		if g.dnsvip != nil {
-			if err := g.dnsvip.RebuildFromPolicy(policy); err != nil {
-				log.Printf("dnsvip rebuild on reload: %v", err)
-			}
-		}
-		// Hot-swap the operational *config.Gateway too — AdminEmail /
-		// PublicURL / DashboardOperators reads pick up immediately.
-		// Listen / CADir / Tailscale changes are not applied (restart).
-		g.cfg = next
-		log.Printf("config reloaded: %d endpoints across %d profile(s)",
-			len(policy.Endpoints), len(policy.Profiles))
-		logDashboardAuthState(g.db, next)
 	}
+}
+
+// reloadConfigFromFileLocked reloads the HCL config and hot-swaps the
+// runtime policy. g.configMu must be held by the caller so file-watch
+// reloads and dashboard writes cannot race each other.
+func (g *Gateway) reloadConfigFromFileLocked(path string) error {
+	next, policy, err := loadConfig(path)
+	if err != nil {
+		return err
+	}
+	g.policy.Store(policy)
+	registerOAuthCredentials(g.oauth, policy)
+	g.connIdx.Store(runtime.BuildConnIndex(policy))
+	if g.tunnels != nil {
+		g.tunnels.SetPolicy(context.Background(), policy)
+	}
+	if g.dnsvip != nil {
+		if err := g.dnsvip.RebuildFromPolicy(policy); err != nil {
+			return fmt.Errorf("dnsvip rebuild on reload: %w", err)
+		}
+	}
+	// Hot-swap the operational *config.Gateway too. Listen / CA dir /
+	// Tailscale process changes are still restart-only.
+	g.cfg.Store(next)
+	log.Printf("config reloaded: %d endpoints across %d profile(s)",
+		len(policy.Endpoints), len(policy.Profiles))
+	logDashboardAuthState(g.db, next)
+	return nil
 }
 
 // logDashboardAuthState emits a one-line summary of dashboard-auth
@@ -2059,7 +2074,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		var truncated bool
 		retryOperationID := strings.TrimSpace(req.Header.Get(hitlRetryOperationHeader))
 		if req.Method == "POST" || req.Method == "PUT" || req.Method == "PATCH" || retryOperationID != "" {
-			matchBody, truncated = bufferHTTPBodyForMatchTruncated(req, g.cfg.BodyBufferLimit())
+			matchBody, truncated = bufferHTTPBodyForMatchTruncated(req, g.cfg.Load().BodyBufferLimit())
 		}
 
 		mreq := &match.Request{
@@ -2203,7 +2218,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 						asyncOp = updated
 					}
 					_ = tc.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					if err := writeHITLOperationAcceptedToConn(tc, asyncOp, g.cfg.PublicURL()); err != nil {
+					if err := writeHITLOperationAcceptedToConn(tc, asyncOp, g.cfg.Load().PublicURL()); err != nil {
 						log.Printf("hitl async pending response write %s: %v", asyncOp.ID, err)
 					}
 					_ = tc.SetWriteDeadline(time.Time{})
@@ -2447,7 +2462,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		trackKind := trackKindFor(host)
 		var trackedReqBody []byte
 		if trackKind != "" {
-			trackedReqBody = bufferHTTPBodyForMatch(req, g.cfg.BodyBufferLimit())
+			trackedReqBody = bufferHTTPBodyForMatch(req, g.cfg.Load().BodyBufferLimit())
 		}
 		// Pre-create session from the request body so streaming SSE
 		// responses (codex /backend-api/codex/responses, anthropic
@@ -2462,7 +2477,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		if trackKind != "" && len(trackedReqBody) > 0 && g.agents != nil {
 			g.preCreateLLMSession(c, trackKind, req.URL.Path, trackedReqBody, sessionHint)
 		}
-		reqS := newSampler(g.cfg.BodyStorageLimit())
+		reqS := newSampler(g.cfg.Load().BodyStorageLimit())
 		if req.Body != nil {
 			req.Body = wrapBodySampler(req.Body, reqS)
 		}
@@ -2501,7 +2516,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				resp.Body = io.NopCloser(io.TeeReader(resp.Body, trackBuf))
 			}
 		}
-		respS := newSampler(g.cfg.BodyStorageLimit())
+		respS := newSampler(g.cfg.Load().BodyStorageLimit())
 		resp.Body = wrapBodySampler(resp.Body, respS)
 		// Close-delimited responses (no Content-Length, no Transfer-
 		// Encoding) come from h2 upstreams that we forced to http/1.1
@@ -2674,7 +2689,7 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			AsyncPendingOnSyncTimeout: c.AsyncPendingOnSyncTimeout,
 			Pool:                      g.hitl,
 			Secrets:                   g.secrets,
-			DashboardURL:              g.cfg.PublicURL(),
+			DashboardURL:              g.cfg.Load().PublicURL(),
 			Policy:                    policy,
 			MessageUpdateSink:         g.recordHITLOperationMessageRef,
 			PendingMessageUpdateSink:  g.hitl.RecordMessageRef,
@@ -2940,7 +2955,6 @@ func runGateway(args []string) {
 		log.Fatalf("oauth: %v", err)
 	}
 	g := &Gateway{
-		cfg:      cfg,
 		cfgPath:  cfgPath,
 		stateDir: stateDir,
 		db:       db,
@@ -2953,7 +2967,12 @@ func runGateway(args []string) {
 		hitl:     newHITLRegistry(sink),
 		onboard:  newOnboardRegistry(),
 	}
-	log.Printf("config: read-only (the dashboard cannot edit gateway.hcl)")
+	g.cfg.Store(cfg)
+	if cfg.DashboardConfigWrites() {
+		log.Printf("config: dashboard writes enabled (generated rules can be appended to gateway.hcl)")
+	} else {
+		log.Printf("config: read-only (the dashboard cannot edit gateway.hcl)")
+	}
 	g.secrets = newGatewaySecretStore(db, oauthReg)
 	g.hitl.asyncGrantResolver = g.resolveAsyncHITLGrant
 	g.hitl.pendingMessageUpdater = g.updatePendingHITLMessage
