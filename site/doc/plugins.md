@@ -170,9 +170,10 @@ The gateway pulls bytes only as deeply as needed:
   to ~1 MiB so the matcher sees the full value, then cancels.
 
 When the plugin sees the cancel it can drop its source reader.
-Bodies that overflow the cap mark the request `Truncated`; any
-rule reading the truncated field is auto-denied (the dispatcher’s
-fail-closed gate, same one that protects the built-in HTTPS body
+Bodies that overflow the cap mark the request `Truncated`: the
+stream-typed fields become CEL unknowns and any rule whose
+condition outcome depends on one is auto-denied (the same
+unevaluable fail-close that protects the built-in HTTPS body
 buffer).
 
 ### Optional facet fields
@@ -181,6 +182,16 @@ Fields marked `Optional: true` may be omitted from the action
 map. The gateway substitutes the kind-zero value (empty string,
 empty list, empty map, 0) before CEL evaluation, so rule
 conditions can reference them without `has()` guards.
+
+The zero-fill covers **declared** fields only. Selecting anything
+else is a runtime evaluation error, which **fails closed**: the
+rule synthesizes a deny instead of silently no-matching (see
+"Unevaluable conditions fail closed" in the rules doc). That
+includes a typo'd field name, a field the manifest never declared,
+and a nested key off a map-shaped value — e.g.
+`example_smtp.headers.x_priority` errors whenever the action's
+`headers` map lacks that key. Guard nested lookups the same way as
+the built-in facets: `'x_priority' in example_smtp.headers && ...`.
 
 ### Reusing a built-in facet
 

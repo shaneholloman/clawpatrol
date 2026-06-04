@@ -59,13 +59,13 @@ CEL variables (all optional in any given condition):
 | `http.query` | `map<string, list<string>>` | Query parameters (multi-valued) |
 | `http.headers` | `map<string, list<string>>` | Request headers (multi-valued) |
 | `http.body` | `string` | Raw request body |
-| `http.body_json` | `dyn` | Parsed JSON body (when `Content-Type` is JSON) |
+| `http.body_json` | `dyn` | Parsed JSON body (when `Content-Type` is JSON). Selecting a field the payload doesn't carry is an evaluation error, which **fails closed** (see "Unevaluable conditions fail closed" below) — guard optional fields with `has()`. |
 
 ```hcl
 condition = "http.method == 'POST' && http.path in ['/v1/refunds', '/v1/payouts']"
 condition = "http.method in ['GET', 'HEAD']"
 condition = "http.body.contains('BEGIN PRIVATE KEY')"
-condition = "http.body_json.archived == true"
+condition = "has(http.body_json.archived) && http.body_json.archived == true"
 ```
 
 ### `sql` family
@@ -134,7 +134,7 @@ rule "k8s-no-secrets" {
 | `k8s.resource` | `string` | `<resource>` or `<resource>/<sub>` for subresources |
 | `k8s.namespace` | `string` | Kubernetes namespace |
 | `k8s.name` | `string` | Resource name |
-| `k8s.params` | `map<string, string>` | Query-string params (e.g. `kubectl exec --stdin`) |
+| `k8s.params` | `map<string, string>` | Query-string params (e.g. `kubectl exec --stdin`). Selecting a key the request doesn't carry is an evaluation error, which **fails closed** — guard with `'<key>' in k8s.params` (see "Unevaluable conditions fail closed" below). |
 
 ```hcl
 condition = "k8s.verb in ['create', 'delete'] && k8s.resource == 'pods'"
@@ -221,10 +221,11 @@ Key properties:
   terminals (`pty`) are never stdin-buffered (block those with
   `ssh.verb == 'pty'`). A stream the gateway can't bound — stdin past
   the inspection cap, or a pause mid-stream with bytes already buffered
-  — is reported truncated and **fail-closes** any `ssh.stdin` rule
-  (deny), so a slow writer can't hide a payload after the inspection
-  window. A command with no stdin at all evaluates against empty stdin
-  and runs normally.
+  — is reported truncated: `ssh.stdin` becomes a CEL unknown and any
+  rule whose outcome depends on it **fail-closes** (deny), so a slow
+  writer can't hide a payload after the inspection window. A command
+  with no stdin at all evaluates against empty stdin and runs
+  normally.
 - **Pre-gate, not envelope only.** Command rules still apply on this
   path — a denied `ssh.command` never reaches upstream either.
 
@@ -438,59 +439,93 @@ code. Otherwise the inner client times out locally and the agent never
 sees the deny response Claw Patrol synthesizes on approval timeout.
 
 
-## Inspection-buffer overflow
+## Unevaluable conditions fail closed
 
-To bound memory, the wire endpoints cap how much of each request they
-buffer for the matcher. A request that exceeds its cap is **not**
-dropped on the floor — the frame still forwards to upstream
-byte-for-byte. What's bounded is the matcher's view of it: the
-endpoint truncates the buffered slice and flags the request as
-truncated. The facet fields that draw their value from this slice
-are **truncatable facet fields** (listed per-endpoint in the table
-below). When a rule's CEL reads a truncatable facet field on a
-request that was flagged truncated, the rule is automatically
-matched without comparing the matching values, and the dispatcher
-returns a deny verdict for it.
+A rule's condition can only produce an honest verdict when every facet
+value its outcome depends on is actually available to the gateway.
+When it isn't, the condition is **unevaluable**, and the dispatcher
+fails closed: the rule fires with a synthesized deny attributed to it
+instead of being silently skipped — skipping would let a deny rule
+fail open. A condition becomes unevaluable in three ways:
 
-| Endpoint | Inspected slice | Cap | Truncatable facet fields |
-|----------|-----------------|-----|--------------------|
-| `https` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | `http.body`, `http.body_json` |
-| `kubernetes` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | *(none — every `k8s.*` facet is derived from the URL and method)* |
-| `clickhouse_https` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
-| `postgres` | `Query` (`Q`) and `Parse` (`P`) frame | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
-| `clickhouse_native` | `Query` packet body | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
+1. **Truncation.** The request overflowed the endpoint's inspection
+   buffer (table below), so facet fields derived from the buffered
+   bytes describe only a prefix. The frame itself still forwards to
+   upstream byte-for-byte (except SSH stdin, which is withheld until
+   the verdict); only the matcher's view is bounded.
+2. **Parser refusal.** A SQL frontend's parser refused the statement,
+   so the parser-derived fields (`sql.verb`, `sql.tables`,
+   `sql.functions`) were never populated. `sql.statement` — the raw
+   text — is populated regardless of parse success and stays
+   matchable.
+3. **Evaluation error.** The CEL program errored at runtime. The
+   common case is selecting a JSON field the body doesn't carry:
+   `http.body_json.archived == true` errors on `{"title": "x"}`.
+   Guard optional fields with `has()`:
+   `has(http.body_json.archived) && http.body_json.archived == true`
+   cleanly no-matches when the field is absent. The same applies to
+   any map-typed facet — `k8s.params.stdin == 'true'` errors when the
+   request URL carries no `stdin` query param; guard with
+   `'stdin' in k8s.params && ...`.
 
-The caps are per-plugin constants in the gateway source — **not
-operator-tunable** today, and not surfaced in `gateway.hcl`. Header
-and URL bytes are bounded separately by `net/http`'s defaults and
-aren't covered here. The `ssh` endpoint has no inspection cap: its
-facet fields come from small, fully-read channel envelopes (the
-channel-open ExtraData and channel-request payloads), never from a
-buffered slice of streamed bytes, so no `ssh.*` field is truncatable.
+### Viral unknowns
 
-### Rule matching semantics on truncated fields
+Truncated and parser-refused facet fields are evaluated as CEL
+**unknowns**. An unknown propagates virally through every operator
+that touches it — `==`, `in`, `exists()`, string functions — the way
+NaN propagates through float arithmetic. The condition only comes
+back unevaluable when its **outcome actually depends** on the
+unavailable value; `&&` / `||` absorption resolves the rest:
 
-When a request overflows its cap, the dispatcher walks the endpoint's
-rules in priority order as usual. For each rule:
+- `sql.verb == 'select' && sql.database == 'prod'` on an unparseable
+  query against database `dev` evaluates `unknown && false == false`:
+  the rule cleanly no-matches and the walk continues to
+  lower-priority rules.
+- `sql.verb == 'select' || sql.database == 'prod'` on an unparseable
+  query against `prod` evaluates `unknown || true == true`: the rule
+  fires as written — whatever the verb was, the outcome is the same.
+- `sql.verb == 'select'` alone is unknown → unevaluable → deny.
 
-- **Catch-all rule** (no `condition`): fires as written. A truncated
-  body can't poison a rule that reads nothing.
-- **Rule whose CEL reads no truncatable facet field** (e.g.
-  `http.method == 'GET'`, `credential = X`, any `k8s.*` predicate):
-  the matcher runs normally — the truncated bytes are irrelevant to
-  its decision.
-- **Rule whose CEL reads a truncatable facet field**: the rule is
-  automatically matched without comparing the matching values. The
-  dispatcher synthesizes a deny attributed to that rule, with this
-  exact reason:
+Note `has()` does **not** rescue a truncated field: the presence test
+itself is unknown (the cut-off bytes might have carried the key). It
+only helps the evaluation-error case on a fully captured body.
+
+### Per-rule dispatch
+
+The dispatcher walks the endpoint's rules in priority order as usual.
+For each rule:
+
+- **Catch-all rule** (no `condition`): fires as written. Unavailable
+  bytes can't poison a rule that reads nothing.
+- **Rule whose condition resolves without the unavailable value**
+  (e.g. `http.method == 'GET'`, `credential = X`, any `k8s.*`
+  predicate, or a compound condition saved by absorption): the
+  matcher runs normally and the verdict is honest.
+- **Rule whose condition is unevaluable**: the dispatcher synthesizes
+  a deny attributed to that rule, with this reason shape:
 
   ```
-  rule "<name>" reads a request facet whose bytes were truncated by the gateway's inspection buffer; failing closed
+  rule "<name>" could not be evaluated against this request (<cause>); failing closed
   ```
 
-  The synthesized rule keeps the original rule's name and priority,
-  so logs and dashboards still attribute the deny to the rule whose
-  contract the truncation broke.
+  where `<cause>` is the coarse category: truncated at the inspection
+  buffer, unparseable, or evaluation error. The full detail — which
+  facet paths the condition depended on, or the CEL error text — is
+  written to the gateway log only. Deny reasons are returned to the
+  agent verbatim, and evaluator errors like `no such key: <field>`
+  would let an agent probe which fields a rule inspects by varying
+  request payloads. The synthesized rule keeps the original rule's
+  name and priority, so logs and dashboards still attribute the deny
+  to the rule whose contract broke.
+
+- **No rule matches at all** (SQL endpoints): when a truncated or
+  unparseable request resolves every rule via absorption and the
+  endpoint declares at least one rule, the gateway denies instead of
+  applying the implicit-allow default — "no rule matched" may simply
+  mean every condition was independent of the missing bytes, not that
+  the operator intended them to flow. Endpoints with no rules keep
+  pass-through, and the backstop never fires on fully-inspected
+  requests.
 
 The upshot: a rule matching on `http.method` and/or `credential` on
 an `https` endpoint still fires on a 2 MiB body, but a
@@ -501,6 +536,25 @@ is forced to deny without paging the approver (HITL can't reason about
 bytes that aren't there); the postgres endpoint surfaces this with the
 reason `"approval required but request was truncated by inspection
 buffer"`.
+
+### Inspection caps
+
+| Endpoint | Inspected slice | Cap | Truncatable facet fields |
+|----------|-----------------|-----|--------------------|
+| `https` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | `http.body`, `http.body_json` |
+| `kubernetes` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | *(none — every `k8s.*` facet is derived from the URL and method)* |
+| `clickhouse_https` | request body on `POST` / `PUT` / `PATCH` | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
+| `postgres` | `Query` (`Q`) and `Parse` (`P`) frame | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
+| `clickhouse_native` | `Query` packet body | 1 MiB | `sql.verb`, `sql.tables`, `sql.functions`, `sql.statement` |
+| `ssh` | session stdin (only on endpoints with an `ssh.stdin` rule) | 1 MiB | `ssh.stdin` |
+
+The caps are per-plugin constants in the gateway source — **not
+operator-tunable** today, and not surfaced in `gateway.hcl`. Header
+and URL bytes are bounded separately by `net/http`'s defaults and
+aren't covered here. The other `ssh.*` facet fields come from small,
+fully-read channel envelopes (the channel-open ExtraData and
+channel-request payloads), never from a buffered slice of streamed
+bytes, so they are never truncatable.
 
 ### How the deny reaches the agent
 
@@ -520,10 +574,13 @@ driver doesn't disconnect:
 ### Why fail-closed
 
 A truncated body might contain content that *would* have triggered a
-deny rule the gateway can't see, so refusing is the safe default. If
-legitimate traffic is expected to exceed the cap, write the rules
-against non-truncatable facet fields only (see the table above) — those
-rules still match on a truncated request and won't auto-deny.
+deny rule the gateway can't see, an unparseable statement might hide a
+write behind syntax the parser couldn't analyse, and a rule that
+errors at evaluation time has expressed an intent the gateway couldn't
+honor — in every case, refusing is the safe default. If legitimate
+traffic is expected to exceed the cap, write the rules against
+non-truncatable facet fields only (see the table above) — those rules
+still match on a truncated request and won't auto-deny.
 
 
 ## Examples
@@ -643,6 +700,7 @@ rule "k8s-no-interactive" {
   priority  = 1000
   condition = <<-CEL
     k8s.resource in ['pods/exec', 'pods/attach']
+    && 'stdin' in k8s.params
     && k8s.params.stdin == 'true'
   CEL
   verdict = "deny"

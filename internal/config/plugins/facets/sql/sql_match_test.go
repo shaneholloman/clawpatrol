@@ -18,12 +18,12 @@ func TestSQLMatcherVerbAndTables(t *testing.T) {
 		Tables: []string{"users", "github_identities"},
 	}
 	req := &match.Request{Family: "sql", Meta: meta}
-	if !m.Match(req) {
+	if m.Match(req).Result != match.Matched {
 		t.Errorf("expected select on github_identities to match")
 	}
 	meta.Verb = "insert"
-	if m.Match(req) {
-		t.Errorf("expected verb mismatch to fail")
+	if got := m.Match(req).Result; got != match.NoMatch {
+		t.Errorf("expected verb mismatch to fail, got %v", got)
 	}
 }
 
@@ -50,8 +50,8 @@ func TestSQLMatcherVerbCaseInsensitive(t *testing.T) {
 				t.Fatalf("NewMatcher: %v", err)
 			}
 			req := &match.Request{Family: "sql", Meta: &sqlfacet.Meta{Verb: "select"}}
-			if got := m.Match(req); got != tc.want {
-				t.Errorf("Match=%v want %v (condition=%q)", got, tc.want, tc.condition)
+			if got := m.Match(req).Result; got != match.ResultOf(tc.want) {
+				t.Errorf("Match=%v want %v (condition=%q)", got, match.ResultOf(tc.want), tc.condition)
 			}
 		})
 	}
@@ -84,8 +84,8 @@ func TestSQLMatcherDatabaseCaseSensitive(t *testing.T) {
 			}
 			meta := tc.meta
 			req := &match.Request{Family: "sql", Meta: &meta}
-			if got := m.Match(req); got != tc.want {
-				t.Errorf("Match=%v want %v (condition=%q meta=%+v)", got, tc.want, tc.condition, tc.meta)
+			if got := m.Match(req).Result; got != match.ResultOf(tc.want) {
+				t.Errorf("Match=%v want %v (condition=%q meta=%+v)", got, match.ResultOf(tc.want), tc.condition, tc.meta)
 			}
 		})
 	}
@@ -113,8 +113,8 @@ func TestSQLMatcherDatabaseSources(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := m.Match(tc.req); got != tc.want {
-				t.Errorf("Match=%v want %v", got, tc.want)
+			if got := m.Match(tc.req).Result; got != match.ResultOf(tc.want) {
+				t.Errorf("Match=%v want %v", got, match.ResultOf(tc.want))
 			}
 		})
 	}
@@ -133,7 +133,7 @@ func TestSQLMatcherDatabaseSurvivesTruncation(t *testing.T) {
 		t.Errorf("a rule reading only sql.database must not be flagged truncatable")
 	}
 	req := &match.Request{Family: "sql", Database: "prod", Truncated: true, Meta: &sqlfacet.Meta{}}
-	if !m.Match(req) {
+	if m.Match(req).Result != match.Matched {
 		t.Errorf("truncated request with database=prod should still match")
 	}
 }
@@ -145,14 +145,57 @@ func TestSQLMatcherStatementRegex(t *testing.T) {
 	}
 	meta := &sqlfacet.Meta{Verb: "select", Statement: "SELECT secret FROM vault"}
 	req := &match.Request{Family: "sql", Meta: meta}
-	if !m.Match(req) {
+	if m.Match(req).Result != match.Matched {
 		t.Errorf("expected regex hit on bare 'secret'")
 	}
 	// `_` is a word character, so \btoken\b should NOT match inside
 	// "api_token" — confirms the regex isn't accidentally
 	// substring-matching.
 	meta.Statement = "SELECT api_token FROM keys"
-	if m.Match(req) {
-		t.Errorf("expected no regex hit on api_token (word boundary)")
+	if got := m.Match(req).Result; got != match.NoMatch {
+		t.Errorf("expected no regex hit on api_token (word boundary), got %v", got)
+	}
+}
+
+// TestSQLMatcherUnparseableViralUnknown pins that the parser-facet
+// unknown propagates to Unevaluable through every operator shape on
+// an Unparseable request — equality, negation, `in` over the unknown
+// list, and a comprehension macro — while the raw statement text
+// (populated regardless of parse success) keeps evaluating honestly.
+func TestSQLMatcherUnparseableViralUnknown(t *testing.T) {
+	unevaluable := []string{
+		"sql.verb == 'select'",
+		"!(sql.verb == 'select')",
+		"'users' in sql.tables",
+		"sql.tables.exists(t, t == 'users')",
+	}
+	for _, cond := range unevaluable {
+		t.Run(cond, func(t *testing.T) {
+			m, err := facet.NewMatcher("sql", cond)
+			if err != nil {
+				t.Fatalf("NewMatcher: %v", err)
+			}
+			req := &match.Request{
+				Family:      "sql",
+				Unparseable: true,
+				Meta:        &sqlfacet.Meta{Statement: "DROP;"},
+			}
+			if got := m.Match(req).Result; got != match.Unevaluable {
+				t.Errorf("Match=%v, want Unevaluable (condition=%q)", got, cond)
+			}
+		})
+	}
+
+	m, err := facet.NewMatcher("sql", "sql.statement.contains('DROP')")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &match.Request{
+		Family:      "sql",
+		Unparseable: true,
+		Meta:        &sqlfacet.Meta{Statement: "DROP;"},
+	}
+	if got := m.Match(req).Result; got != match.Matched {
+		t.Errorf("statement rule on unparseable request: Match=%v, want Matched", got)
 	}
 }

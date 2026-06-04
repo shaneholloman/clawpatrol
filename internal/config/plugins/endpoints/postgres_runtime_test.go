@@ -704,9 +704,10 @@ func TestPgEvaluate_Audit143(t *testing.T) {
 // statement to the matcher at all, the matcher will fire."
 type passThrough struct{}
 
-func (passThrough) Match(*match.Request) bool      { return true }
+func (passThrough) Match(*match.Request) match.Decision {
+	return match.Decision{Result: match.Matched}
+}
 func (passThrough) InspectsTruncatableFacet() bool { return false }
-func (passThrough) InspectsUnparseableFacet() bool { return false }
 
 // TestPgEvaluateUnparseableSynthDeny exercises the postgres side of
 // the Unparseable contract end-to-end: a request whose parser
@@ -748,7 +749,7 @@ rule "ban-drops" {
 		t.Fatalf("pgEvaluate(\"DROP;\") verdict = %q reason = %q, want deny", v, reason)
 	}
 	// The synth reason names the rule whose contract the unparseable
-	// request broke — dispatch.go:134's generic phrasing.
+	// request broke and the cause the matcher reported.
 	if !strings.Contains(reason, "ban-drops") || !strings.Contains(reason, "unparseable") {
 		t.Errorf("reason = %q, want it to name the rule and mention 'unparseable'", reason)
 	}
@@ -916,5 +917,47 @@ func TestPgEvaluateThreadsDatabaseIntoMeta(t *testing.T) {
 	}
 	if v, _ := pgEvaluate(ch, "SELECT 1", "", "Prod"); v != "" {
 		t.Errorf("SELECT on Prod verdict = %q, want allow (verb mismatch)", v)
+	}
+}
+
+// TestPgEvaluateUnparseableBackstopDeny pins the wiring of
+// runtime.MatchRequestFailClosed through pgEvaluateInfo: an
+// unparseable statement whose only rule resolves via absorption
+// (`unknown && false == false` → NoMatch) must NOT ride the
+// implicit-allow default — the backstop denies because the endpoint
+// declares rules and the bytes were uninspectable.
+func TestPgEvaluateUnparseableBackstopDeny(t *testing.T) {
+	ep := pgEndpointFromHCL(t, `
+endpoint "postgres" "db" {
+  host = "db.example.com:5432"
+}
+credential "postgres_credential" "db-cred" { endpoint = postgres.db }
+profile "default" { credentials = [postgres_credential.db-cred] }
+
+rule "deny-prod-drops" {
+  endpoint  = postgres.db
+  condition = "sql.verb == 'drop' && sql.database == 'prod'"
+  verdict   = "deny"
+}
+`)
+	ch := &runtime.ConnHandle{
+		Endpoint: ep,
+		Emit:     func(runtime.ConnEvent) {},
+	}
+	// Unparseable piece, database 'dev': the rule absorbs to false,
+	// no rule matches, the backstop denies.
+	v, reason := pgEvaluate(ch, "DROP;", "", "dev")
+	if v != "deny" {
+		t.Fatalf("pgEvaluate(\"DROP;\", db=dev) verdict = %q reason = %q, want backstop deny", v, reason)
+	}
+	if !strings.Contains(reason, "unparseable") {
+		t.Errorf("reason = %q, want it to name the cause", reason)
+	}
+	// A parseable SELECT against the same endpoint still falls
+	// through to implicit allow — the backstop only guards
+	// uninspectable requests.
+	v, reason = pgEvaluate(ch, "SELECT 1", "", "dev")
+	if v != "" {
+		t.Fatalf("pgEvaluate(\"SELECT 1\") verdict = %q reason = %q, want implicit allow", v, reason)
 	}
 }

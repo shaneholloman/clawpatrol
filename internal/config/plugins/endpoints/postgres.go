@@ -124,8 +124,8 @@ func (PostgresEndpointRuntime) DetectPlaceholder(req *runtime.Request, candidate
 // Returns *sqlfacet.Meta as `any` to keep the runtime interface free
 // of the facets-package import. The bool mirrors the Unparseable
 // contract — true when pgplex refused the bytes; the fixture loader
-// then sets match.Request.Unparseable so the dispatcher's fail-closed
-// gate evaluates the test request the same way live dispatch would.
+// then sets match.Request.Unparseable so the unevaluable fail-close
+// evaluates the test request the same way live dispatch would.
 func (PostgresEndpointRuntime) ParseStatement(sql string) (any, bool) {
 	info, unparseable := parseSQL(sql)
 	return &sqlfacet.Meta{
@@ -390,8 +390,8 @@ func pgStartupParam(body []byte, key string) string {
 // force the gateway to either accumulate it (OOM) or forward it
 // uninspected. The wire pump refuses to buffer past this cap: Q / P
 // frames whose declared length exceeds it take the truncated-frame
-// path (pgHandleOversizeFrame), which lets the dispatcher fail-close
-// any rule that would have read the now-discarded statement bytes,
+// path (pgHandleOversizeFrame), which fail-closes any rule whose
+// outcome would have depended on the now-discarded statement bytes,
 // and otherwise streams the frame through unbuffered.
 const maxPgMessage = 1 << 20
 
@@ -507,24 +507,27 @@ func pgClientToServer(ctx context.Context, ch *runtime.ConnHandle, upstream net.
 //
 //   - Build a SQL match.Request with Truncated=true and empty
 //     Verb / Statement / Tables / Functions. The frontend can't
-//     parse SQL out of bytes it refused to buffer, and the
-//     dispatcher's job is to decide off the rule's truncatable-facet
-//     references, not off whatever prefix did fit.
-//   - runtime.MatchRequest walks the rule list. A rule whose CEL
-//     reads sql.* will be auto-synthesized to deny (config/runtime/
-//     dispatch.go); a rule that only reads credential or has no
-//     condition still matches normally.
+//     parse SQL out of bytes it refused to buffer; every sql.* facet
+//     path is a CEL unknown, so a rule whose outcome depends on the
+//     discarded bytes evaluates Unevaluable and synth-denies, while
+//     a rule that resolves on credential / sql.database / a catch-all
+//     still matches normally.
+//   - runtime.MatchRequestFailClosed walks the rule list. When the
+//     endpoint declares rules and none matched (every condition
+//     resolved independent of the missing bytes), it synthesizes a
+//     deny rather than letting the uninspectable frame ride the
+//     implicit-allow default. Rule-less endpoints keep pass-through.
 //
 // Then:
 //
 //   - Deny → drain remaining frame bytes from the wire, send
 //     ErrorResponse + ReadyForQuery to the agent (pgWriteDeny), do
 //     NOT touch upstream.
-//   - Allow / no match → forward every byte verbatim to upstream
-//     (the buffered prefix + the wire tail streamed through
-//     io.CopyN). The upstream sees a single oversize Q / P frame
-//     exactly as the agent emitted it; the gateway just declined to
-//     materialize the body in memory.
+//   - Allow (a rule explicitly matched) / no rules on the endpoint →
+//     forward every byte verbatim to upstream (the buffered prefix +
+//     the wire tail streamed through io.CopyN). The upstream sees a
+//     single oversize Q / P frame exactly as the agent emitted it;
+//     the gateway just declined to materialize the body in memory.
 //   - Approve chain → treated as deny. HITL can't make a decision
 //     on bytes that aren't there.
 func pgHandleOversizeFrame(ch *runtime.ConnHandle, upstream net.Conn, credName, database string, buf []byte, length uint32) ([]byte, bool) {
@@ -550,7 +553,7 @@ func pgHandleOversizeFrame(ch *runtime.ConnHandle, upstream net.Conn, credName, 
 	if f := facet.Lookup("sql"); f != nil {
 		facets = f.Report(mreq)
 	}
-	cr := runtime.MatchRequest(ch.Endpoint, mreq)
+	cr := runtime.MatchRequestFailClosed(ch.Endpoint, mreq)
 
 	deny, reason := false, ""
 	if cr != nil {
@@ -635,9 +638,9 @@ func pgEvaluate(ch *runtime.ConnHandle, sql, credName, database string) (string,
 // suppresses emission on allow / hitl_allow so synthesised
 // sub-statements don't pollute the dashboard; deny emissions still
 // fire either way (operators need to see *why* a batch was denied).
-// unparseable propagates onto match.Request so the dispatcher's
-// fail-closed-on-Unparseable gate auto-denies any rule reading
-// verb / tables / functions for a piece pgplex refused.
+// unparseable propagates onto match.Request so the matcher marks
+// verb / tables / functions as CEL unknowns for a piece pgplex
+// refused — any rule whose outcome depends on them is denied.
 func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database string, shadow, unparseable bool) (string, string) {
 	summary := pgSummary(info)
 	mreq := &match.Request{
@@ -662,7 +665,7 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 	if f := facet.Lookup("sql"); f != nil {
 		facets = f.Report(mreq)
 	}
-	cr := runtime.MatchRequest(ch.Endpoint, mreq)
+	cr := runtime.MatchRequestFailClosed(ch.Endpoint, mreq)
 	if cr == nil {
 		// No rule matched — implicit allow. Emit so the query
 		// shows up in the dashboard's actions tab anyway; the
@@ -872,10 +875,10 @@ type pgInfo struct {
 // Unparseable mirrors match.Request.Unparseable for this piece — set
 // when pgplex's grammar refuses the bytes outright. The wire-protocol
 // gateway propagates the flag onto each per-statement match.Request,
-// so the dispatcher's fail-closed-on-Unparseable gate auto-denies any
-// rule whose CEL reads verb / tables / functions on a piece the
-// parser couldn't analyse. Statement text is preserved either way,
-// so `sql.statement.contains(...)` rules still evaluate honestly.
+// so verb / tables / functions become CEL unknowns on a piece the
+// parser couldn't analyse and any rule whose outcome depends on them
+// is denied. Statement text is preserved either way, so
+// `sql.statement.contains(...)` rules still evaluate honestly.
 type analysedStmt struct {
 	Outer       pgInfo
 	Inner       []pgInfo
