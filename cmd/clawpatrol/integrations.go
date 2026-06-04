@@ -327,6 +327,155 @@ func applyEnvPushdownVars(vars []pushdownEnvVar) {
 	}
 }
 
+// installClaudeCodeOAuthShim is the `clawpatrol run claude` workaround
+// for Claude Code's local auth-mode gate.
+//
+// Claude Code refuses `/remote-control` whenever the session looks
+// like API-key/bearer auth. Verified by inspecting the shipped binary
+// (v2.1.156): the eligibility reason-builder returns, verbatim,
+// "Remote Control requires claude.ai subscription auth. ANTHROPIC_AUTH_TOKEN
+// is set, so this session is using API-key auth — unset it (or run in a
+// shell without it) to use Remote Control." whenever
+// `process.env.ANTHROPIC_AUTH_TOKEN` is present (the same builder also
+// rejects ANTHROPIC_API_KEY and apiKeyHelper). The companion scope check
+// reads `scopes` off the LOCAL `.credentials.json`, not the upstream
+// Authorization header — so a gateway that rewrites the header at MITM
+// time cannot satisfy the gate: Claude Code bails before any network
+// call. See anthropics/claude-code#33105, #35407, #48378.
+//
+// To preserve OAuth-only features without requiring `claude /login` on
+// every worker, this helper materializes a synthesized `.credentials.json`
+// in a CLAUDE_CONFIG_DIR and strips ANTHROPIC_AUTH_TOKEN from the env so
+// Claude Code drops out of bearer mode (precedence #2) and falls through
+// to subscription OAuth (precedence #6). The gateway still swaps the
+// Authorization header upstream, so the placeholder bytes never reach
+// Anthropic — the operator's gateway-stored OAuth bearer (carrying the
+// scopes from AnthropicOAuthSubscription.OAuthFlow, including
+// user:sessions:claude_code) is what authenticates the session-register
+// call `/remote-control` depends on.
+//
+// This rewrite of the worker's environment and config dir is OFF by
+// default (R&D decision, 2026-06-03): silently materializing credentials
+// and pointing CLAUDE_CONFIG_DIR at a clawpatrol-managed dir would shadow
+// the worker's existing ~/.claude (skills, memory, MCP servers, project
+// state) and edit files clawpatrol doesn't own. Instead, when the shim
+// *would* apply we print how to turn it on and otherwise leave the env
+// untouched; the operator opts in explicitly with
+// CLAWPATROL_CLAUDE_OAUTH_SHIM=1.
+//
+// No-op (env left unchanged) when:
+//   - the wrapped command is not `claude` — raw Anthropic SDK clients
+//     (Python, Node, …) still want ANTHROPIC_AUTH_TOKEN unchanged.
+//   - ANTHROPIC_AUTH_TOKEN is unset — the OAuth subscription plugin
+//     isn't bound to this profile, so there's nothing to shim.
+//   - the operator hasn't opted in via CLAWPATROL_CLAUDE_OAUTH_SHIM=1 —
+//     a one-time notice is printed pointing at the opt-in.
+//
+// Once opted in, it is also a no-op (beyond dropping the bearer) when the
+// operator pointed CLAUDE_CONFIG_DIR at a dir that already holds a real
+// `.credentials.json` — that login wins once we drop the bearer, so we
+// leave it untouched.
+func installClaudeCodeOAuthShim(cmd []string) {
+	if len(cmd) == 0 || filepath.Base(cmd[0]) != "claude" {
+		return
+	}
+	bearer := os.Getenv("ANTHROPIC_AUTH_TOKEN")
+	if bearer == "" {
+		return
+	}
+	// Opt-in only. Writing credentials + repointing CLAUDE_CONFIG_DIR can
+	// shadow the worker's ~/.claude and touch files we don't own, so we
+	// never do it silently — tell the operator how to enable it instead.
+	if os.Getenv("CLAWPATROL_CLAUDE_OAUTH_SHIM") != "1" {
+		warnClaudeCodeRemoteControlDisabled()
+		return
+	}
+	// Honor an operator-set CLAUDE_CONFIG_DIR so Claude Code keeps its
+	// settings/MCP/project state living there; otherwise carve out a
+	// clawpatrol-managed dir that leaves the worker's ~/.claude untouched.
+	dir := os.Getenv("CLAUDE_CONFIG_DIR")
+	managed := dir == ""
+	if managed {
+		dir = filepath.Join(defaultClawpatrolDir(), "claude-config")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("clawpatrol: claude oauth shim: mkdir %s: %v", dir, err)
+		return
+	}
+	credPath := filepath.Join(dir, ".credentials.json")
+	// Don't clobber a real /login that already lives in an operator-set
+	// config dir — dropping ANTHROPIC_AUTH_TOKEN below lets it win on its
+	// own. (We always (re)write our own managed dir: it's clawpatrol's.)
+	if !managed {
+		if _, err := os.Stat(credPath); err == nil {
+			_ = os.Unsetenv("ANTHROPIC_AUTH_TOKEN")
+			return
+		}
+	}
+	if err := writeClaudeCodeCredentials(credPath, bearer); err != nil {
+		log.Printf("clawpatrol: claude oauth shim: write credentials: %v", err)
+		return
+	}
+	// Redirect Claude Code's credential read onto our synthesized file
+	// (only when we own the dir; an operator-set one is already exported).
+	// Unsetting ANTHROPIC_AUTH_TOKEN drops Claude Code out of precedence #2
+	// so the synthesized credentials.json (precedence #6) wins.
+	if managed {
+		_ = os.Setenv("CLAUDE_CONFIG_DIR", dir)
+	}
+	_ = os.Unsetenv("ANTHROPIC_AUTH_TOKEN")
+}
+
+// warnClaudeCodeRemoteControlDisabled tells the operator why
+// /remote-control (and other claude.ai subscription-only features) won't
+// work in this session, and how to opt into the credential shim that
+// makes them work. Printed instead of silently rewriting the worker's
+// environment and config dir (R&D decision, 2026-06-03).
+func warnClaudeCodeRemoteControlDisabled() {
+	log.Printf(`clawpatrol: Claude Code /remote-control and other claude.ai
+subscription-only features are disabled in this session: ANTHROPIC_AUTH_TOKEN
+is set, so Claude Code treats this as API-key auth and gates them off locally.
+
+To enable them, opt into the OAuth shim:
+
+    CLAWPATROL_CLAUDE_OAUTH_SHIM=1 clawpatrol run claude ...
+
+The shim writes a synthesized .credentials.json and points CLAUDE_CONFIG_DIR at
+it for the child. Because that shadows your existing ~/.claude (skills, memory,
+MCP servers, project state), it is off by default — set CLAUDE_CONFIG_DIR to
+your own dir first if you want both. See doc/claude-code-oauth.md.`)
+}
+
+// writeClaudeCodeCredentials emits the JSON shape Claude Code's
+// `/login` flow persists to `.credentials.json`. Only the fields gating
+// the local feature check are populated — expiresAt is parked far in the
+// future so Claude Code doesn't try to refresh against
+// console.anthropic.com (which the gateway typically does not intercept).
+// The bearer is the same placeholder the env-var path uses; the gateway's
+// MITM rewrites Authorization upstream.
+func writeClaudeCodeCredentials(path, bearer string) error {
+	body, err := json.MarshalIndent(map[string]any{
+		"claudeAiOauth": map[string]any{
+			"accessToken":  bearer,
+			"refreshToken": "sk-ant-ort01-clawpatrol-placeholder-do-not-use",
+			// 2286-11-20T17:46:39.999Z — well past any plausible worker
+			// lifetime. Claude Code refreshes only when it considers the
+			// token expired.
+			"expiresAt": int64(9999999999999),
+			"scopes": []string{
+				"user:inference",
+				"user:profile",
+				"user:sessions:claude_code",
+			},
+			"subscriptionType": "max",
+		},
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, body, 0o600)
+}
+
 // Model context-window lookup. Sourced from litellm's
 // model_prices_and_context_window.json (refreshed at startup, hourly).
 // Avoids hardcoding ctx_max per model — litellm tracks all major

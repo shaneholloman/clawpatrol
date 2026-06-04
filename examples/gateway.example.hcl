@@ -200,7 +200,11 @@ endpoint "kubernetes" "k8s-prod" { server = "198.51.100.11" }
 # AI providers — three common shapes.
 #
 #   anthropic_oauth_subscription — Claude Pro/Max subscription. The
-#     binary handles the OAuth flow at first dashboard visit.
+#     binary handles the OAuth flow at first dashboard visit. For the
+#     `claude` CLI, OAuth-only features like `/remote-control` need a
+#     local OAuth credential; `clawpatrol run` can shim one in, but only
+#     when you opt in with CLAWPATROL_CLAUDE_OAUTH_SHIM=1 (off by default
+#     since it shadows ~/.claude) — see doc/claude-code-oauth.md.
 #   anthropic_manual_key         — raw API key from console.anthropic.com.
 #     Use this when you also need to call the API from your own
 #     rules (the llm_approver below).
