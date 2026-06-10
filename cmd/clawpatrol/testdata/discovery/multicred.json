@@ -1,0 +1,55 @@
+{
+  "profile": "dba",
+  "endpoints": [
+    {
+      "name": "pg",
+      "type": "postgres",
+      "family": "sql",
+      "hosts": [
+        "pg.example"
+      ],
+      "port": 5432,
+      "sslmode": "require",
+      "credentials": [
+        {
+          "name": "pg-ro",
+          "type": "postgres_credential",
+          "disambiguators": {
+            "database": "app",
+            "user": "reader"
+          },
+          "description": "read-only: reporting and ad-hoc queries"
+        },
+        {
+          "name": "pg-rw",
+          "type": "postgres_credential",
+          "disambiguators": {
+            "database": "app",
+            "user": "writer"
+          },
+          "description": "read-write: schema migrations and data fixes"
+        }
+      ],
+      "hint": "psql \"host=pg.example port=5432 user=reader dbname=app sslmode=require\""
+    }
+  ],
+  "credentials": [
+    {
+      "name": "pg-ro",
+      "type": "postgres_credential",
+      "endpoints": [
+        "pg"
+      ],
+      "description": "read-only: reporting and ad-hoc queries"
+    },
+    {
+      "name": "pg-rw",
+      "type": "postgres_credential",
+      "endpoints": [
+        "pg"
+      ],
+      "description": "read-write: schema migrations and data fixes"
+    }
+  ],
+  "env_vars": []
+}

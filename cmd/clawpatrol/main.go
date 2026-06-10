@@ -1419,6 +1419,13 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 		// by IP and never sends SNI).
 		if dstIP != "" {
 			c := wrapPeek(raw, prefix)
+			if g.isInternalVIP(dstIP) {
+				// Fixed-IP fallback for `curl https://<internal-vip>/`
+				// when DNS interception isn't active — no SNI on an IP
+				// literal, so the dst VIP is the only signal.
+				g.serveInternal(c, dstIP)
+				return
+			}
 			pip := peerIP(c)
 			profile := g.profileFor(pip)
 			ep, authority, certHost := g.httpsMITMEndpoint(profile, dstIP, dstPort)
@@ -1433,6 +1440,12 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 	}
 	c := wrapPeek(raw, prefix)
 	log.Printf("sni-peek: %s", host)
+	if isInternalHost(host) {
+		// Reserved internal API name: serve the caller's profile
+		// manifest (and CA/info) locally and never proxy upstream.
+		g.serveInternal(c, internalHostname)
+		return
+	}
 	pip := peerIP(c)
 	profile := g.profileFor(pip)
 	ep, authority, certHost := g.httpsMITMEndpoint(profile, host, dstPort)

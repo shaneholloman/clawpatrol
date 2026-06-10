@@ -25,6 +25,13 @@ type CompiledPolicy struct {
 	HumanTimeout   int
 	HumanOnTimeout string
 
+	// DashboardURL mirrors gateway.public_url — the canonical URL where
+	// an operator reaches the dashboard to configure device profiles.
+	// Surfaced here so the discovery manifest can point an agent (or its
+	// human) at the dashboard when its profile grants nothing. Empty when
+	// public_url is unset.
+	DashboardURL string
+
 	// Profiles indexed by name. Each holds a per-endpoint rule list,
 	// already family-tagged and priority-sorted.
 	Profiles map[string]*CompiledProfile
@@ -110,6 +117,11 @@ type CompiledEndpoint struct {
 	Hosts       []string
 	Credentials []*Entity       // credentials globally bound to this endpoint
 	Rules       []*CompiledRule // sorted by priority desc
+
+	// Description is the operator-supplied free-text note from the
+	// block's `description = "..."` framework attr, or "" if unset.
+	// Surfaced in the discovery manifest to orient agents.
+	Description string
 
 	// InspectsTruncatable is true when any rule on this endpoint reads a
 	// facet whose bytes a wire frontend buffers under a cap (for ssh:
@@ -270,6 +282,7 @@ func Compile(gw *Gateway) (*CompiledPolicy, error) {
 		LLMCacheTTL:    d.LLMCacheTTL,
 		HumanTimeout:   d.HumanTimeout,
 		HumanOnTimeout: d.HumanOnTimeout,
+		DashboardURL:   gw.PublicURL(),
 		Profiles:       map[string]*CompiledProfile{},
 		Endpoints:      map[string]*CompiledEndpoint{},
 		Tunnels:        map[string]*CompiledTunnel{},
@@ -508,10 +521,11 @@ func attachCredentials(cp *CompiledPolicy, p *Policy) error {
 
 func compileEndpoint(name string, ent *Entity, cp *CompiledPolicy) (*CompiledEndpoint, error) {
 	ce := &CompiledEndpoint{
-		Name:   name,
-		Family: ent.Plugin.Family,
-		Plugin: ent.Plugin,
-		Body:   ent.Body,
+		Name:        name,
+		Family:      ent.Plugin.Family,
+		Plugin:      ent.Plugin,
+		Body:        ent.Body,
+		Description: ent.Framework.Str("description"),
 	}
 	// Hosts live on the plugin's typed body. We cross-cut via a small
 	// interface so the compile pass doesn't have to know every
