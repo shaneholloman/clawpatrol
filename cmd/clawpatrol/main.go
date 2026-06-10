@@ -2354,6 +2354,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				// an upstream lookup can't accidentally leak them.
 				stripAuthResponseHeaders(r.Header)
 				stripAuthResponseHeaders(r.Trailer)
+				stripAltSvc(r.Header)
 				writeErr := r.Write(tc)
 				if hitlRetryConsumedOperation != nil {
 					toState := HITLOperationStateUpstreamSucceeded
@@ -2546,6 +2547,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// still wants to show what the upstream actually sent.
 		ev.RespHeaders = flatHeaders(resp.Header)
 		stripAuthResponseHeaders(resp.Header)
+		stripAltSvc(resp.Header)
 		// Trailers fall outside resp.Header — Go's http.Transport
 		// surfaces them on resp.Trailer and http.Response.Write
 		// emits them after the chunked body. RFC 9110 §6.5.1 bans
@@ -3126,12 +3128,21 @@ func runGateway(args []string) {
 				g.dnsvip.ServeUDP(c, dstIP)
 				return true
 			}
+			if dstPort == 443 && g.dnsvip.IsVIP(dstIP) {
+				// QUIC / HTTP-3 to an intercepted (VIP'd) host: drop so
+				// the client falls back to TCP/443, which we MITM.
+				// Relaying it would let that host's HTTPS bypass
+				// interception. UDP/443 to a passed-through host falls
+				// through to relayUDP — we don't intercept it.
+				_ = c.Close()
+				return true
+			}
 			return false
 		}
 		if err := wg.EnablePromiscuousForwarder(tcpDispatch, udpDispatch); err != nil {
 			log.Fatalf("wireguard forwarder: %v", err)
 		}
-		log.Printf("wireguard promiscuous forwarder ready (any dst → :443=mitm, :5432=pg, :53=dns-vip, VIP=ssh|ch_native, :%d=dash, plugins=conn-index, else=relay)", dashPort)
+		log.Printf("wireguard promiscuous forwarder ready (any dst → :443=mitm, UDP/443→drop(quic) for VIPs, :5432=pg, :53=dns-vip, VIP=ssh|ch_native, :%d=dash, plugins=conn-index, else=relay)", dashPort)
 	}
 
 	tsnetServer, ln, err := openListener(cfg, stateDir)
@@ -3263,13 +3274,14 @@ func runGateway(args []string) {
 				log.Printf("tsnet: dnsvip UDP listener on %s:53", g.tailscaleIP)
 				serveTsnetDNSUDP(pc, g.dnsvip)
 			}()
-			// Layer a UDP/53 catch-all onto tsnet's underlying netstack so
-			// exit-node clients whose system resolver targets a public IP
-			// (8.8.8.8, 1.1.1.1) still reach dnsvip — the IP-bound listener
-			// above only catches packets aimed at the gateway's own tailnet
-			// IP. tsnet has no public UDP fallback hook, so this reaches
-			// through Sys().Netstack (see installTsnetUDPDNSCatchAll).
-			g.installTsnetUDPDNSCatchAll(tsnetServer)
+			// Layer a UDP catch-all onto tsnet's underlying netstack so
+			// exit-node clients' UDP reaches clawpatrol: UDP/53 to any
+			// resolver IP reaches dnsvip (the IP-bound listener above only
+			// catches packets aimed at the gateway's own tailnet IP), and
+			// other UDP from onboarded peers is relayed. tsnet has no public
+			// UDP fallback hook, so this reaches through Sys().Netstack (see
+			// installTsnetUDPCatchAll).
+			g.installTsnetUDPCatchAll(tsnetServer)
 		}
 		// Intercept all TCP forwarded through this exit node (whole-machine
 		// clients). dst is the original internet destination — same dispatch

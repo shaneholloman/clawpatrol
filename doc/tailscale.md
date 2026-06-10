@@ -28,7 +28,21 @@ no subnet allocation — Tailscale's control plane handles all of that.
 4. All outbound traffic now exits through the gateway. The gateway
    intercepts at L4 — TCP/443 → SNI peek → MITM or splice, everything
    else forwarded via `wgRelay` / `relayUDP`. Tailscale handles NAT
-   traversal and relay (DERP).
+   traversal and relay (DERP). UDP gets the same dispatch as WireGuard
+   mode even on the tsnet exit-node path: a catch-all on tsnet's netstack
+   (`GetUDPHandlerForFlow`) sends UDP/53 to any resolver IP to `dnsvip`
+   and relays other UDP from onboarded peers via `relayUDP` — so a
+   tsnet-mode `clawpatrol run` child gets arbitrary UDP (NTP, custom
+   protocols) without a UDP-over-TCP shim, since the userspace exit node
+   already receives the datagrams. **QUIC / HTTP-3 (UDP/443) to an
+   intercepted host is dropped** in both modes so HTTPS can't ride UDP
+   past the TCP/443 SNI-peek MITM — the client falls back to
+   interceptable TCP. UDP/443 to a host the gateway *passes through* (no
+   VIP) is relayed normally: clawpatrol doesn't intercept that host's
+   HTTPS either, so there's nothing to bypass and no reason to break its
+   HTTP/3. For the hosts it does MITM, the gateway also strips the
+   `Alt-Svc` response header so agents don't discover h3 in the first
+   place (intercepted names already return no SVCB/HTTPS DNS record).
 5. Device identity (hostname, OS, Tailscale user) is populated via
    `tailscale whois` at first connection — richer than WireGuard mode
    which only captures hostname at join time.
