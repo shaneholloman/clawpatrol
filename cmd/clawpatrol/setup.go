@@ -372,15 +372,7 @@ func finishJoinSetup(s *joinSetup, skipTrust, wholeMachine bool) {
 		}
 		return
 	}
-	if !skipTrust {
-		if err := installCATrust(s.caPath); err != nil {
-			s.caHint = manualTrustHint(s.caPath)
-		} else {
-			s.caInstalled = true
-		}
-	} else {
-		s.caHint = manualTrustHint(s.caPath)
-	}
+	s.installTrust(skipTrust)
 	if wholeMachine {
 		if err := installShellRC(); err == nil {
 			s.shellRC = true
@@ -667,8 +659,36 @@ func fetchCA(ip, dst string) error {
 	return nil
 }
 
+// installTrust installs the fetched CA into the system trust store
+// behind a live step ("* Installing CA in system trust" → "✓ CA
+// installed in system trust" / "! CA not trusted yet — …") and records
+// the outcome on s. Idempotent: a no-op once s.caInstalled is set (the
+// WireGuard path installs early, before the mode-specific branch).
+func (s *joinSetup) installTrust(skipTrust bool) {
+	if s.caInstalled {
+		return
+	}
+	if skipTrust {
+		s.caHint = manualTrustHint(s.caPath)
+		fmt.Println("! CA fetched but not trusted (--no-trust) — install manually: " + s.caHint)
+		return
+	}
+	// Erase-on-done only when sudo won't prompt — an interactive
+	// password prompt prints inside the step and breaks the cursor
+	// math. sudo -n returns non-zero (without prompting) when a
+	// password would be needed, and errors when sudo is absent.
+	erasable := exec.Command("sudo", "-n", "true").Run() == nil
+	finish := beginStep("Installing CA in system trust", nil, erasable)
+	if err := installCATrust(s.caPath); err != nil {
+		s.caHint = manualTrustHint(s.caPath)
+		finish("! CA not trusted yet — install manually: " + s.caHint)
+	} else {
+		s.caInstalled = true
+		finish("✓ CA installed in system trust")
+	}
+}
+
 func installCATrust(caPath string) error {
-	fmt.Println("Installing CA certificate into system trust store (requires sudo)...")
 	switch runtime.GOOS {
 	case "darwin":
 		return exec.Command("sudo", "security", "add-trusted-cert",
@@ -771,41 +791,6 @@ func fail(format string, a ...any) {
 	os.Exit(2)
 }
 
-// startSpinner paints a braille spinner + label on the current line and
-// returns a stop function that clears the line. Tick is 80ms — fast
-// enough to feel alive while the device-flow poll loop sits on its
-// 3-second interval. Writes only land on stderr-attached TTYs; if stdout
-// isn't a terminal (CI, piped logs) the spinner suppresses itself so it
-// doesn't scribble control codes into log files.
-func startSpinner(label string) func() {
-	if !isTerminal(os.Stdout) {
-		return func() {}
-	}
-	frames := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		i := 0
-		t := time.NewTicker(80 * time.Millisecond)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				fmt.Printf("\r\033[K")
-				return
-			case <-t.C:
-				fmt.Printf("\r%c %s", frames[i%len(frames)], label)
-				i++
-			}
-		}
-	}()
-	return func() {
-		close(stop)
-		<-done
-	}
-}
-
 func isTerminal(f *os.File) bool {
 	fi, err := f.Stat()
 	if err != nil {
@@ -814,16 +799,14 @@ func isTerminal(f *os.File) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-// printTreeItems prints a list as ├-prefixed sub-items with the final
-// entry marked └ (bottom-corner). Same box-drawing family so the glyphs
-// align visually instead of mixing the heavier ⎿ corner.
-func printTreeItems(items []string) {
-	for i, line := range items {
-		prefix := "├ "
-		if i == len(items)-1 {
-			prefix = "└ "
-		}
-		fmt.Println(prefix + line)
+// printChecklist prints each line on its own row. Lines already carry
+// their own status marker ("✓ " success, "! " needs-attention) from the
+// caller / setupSummaryItems, so this is a plain printer — no tree
+// glyphs, which previously made the items read as sub-steps of whatever
+// progress line preceded them.
+func printChecklist(items []string) {
+	for _, line := range items {
+		fmt.Println(line)
 	}
 }
 
@@ -832,16 +815,14 @@ func printTreeItems(items []string) {
 // shell-rc updates surface as their own items so the operator sees what
 // they need to do manually; success cases stay quiet to keep the block
 // short.
+// setupSummaryItems returns the trailing checklist items that aren't
+// already reported by their own live step. CA trust is handled by
+// joinSetup.installTrust at install time, so it's intentionally not
+// repeated here.
 func setupSummaryItems(s joinSetup) []string {
 	var out []string
-	switch {
-	case s.caInstalled:
-		out = append(out, "CA installed in system trust")
-	case s.caHint != "":
-		out = append(out, "CA at "+s.caPath+" — trust manually: "+s.caHint)
-	}
 	if s.shellRC {
-		out = append(out, `Shell rc: eval "$(clawpatrol env)"`)
+		out = append(out, `✓ shell rc updated (eval "$(clawpatrol env)")`)
 	}
 	return out
 }
@@ -975,59 +956,53 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		if profile != "" {
 			aq.Set("profile", profile)
 		}
-		approveURL := gateway + "/api/onboard/approve?" + aq.Encode()
-		if ar, aerr := cli.Post(approveURL, "application/json", nil); aerr == nil {
+		// Approve must hit the same origin the dashboard's Approve
+		// button POSTs from — the operator-gated dashboard/API, where
+		// the bootstrap node's tailnet whois identity is checked. The
+		// `gateway` arg is the join URL, which for a funnel-enabled
+		// gateway is the public :443 Funnel whose allowlist excludes
+		// /api/onboard/approve (it would 404). verify_url already
+		// points at that dashboard origin (the tailnet :8080 API in
+		// tsnet mode), so derive the approve base from it.
+		approveBase := approveBaseFromVerifyURL(start.VerifyURL, gateway)
+		approveURL := approveBase + "/api/onboard/approve?" + aq.Encode()
+		finish := beginStep("Approving as tailnet operator", nil, true)
+		// Bound the self-approve POST. It dials the gateway's tailnet IP,
+		// which hangs indefinitely if this machine logged into a tailnet
+		// that doesn't include the gateway (e.g. the wrong account at the
+		// Tailscale login prompt). On timeout / error, fall back to
+		// dashboard approval rather than wedging the whole join.
+		actx, acancel := context.WithTimeout(context.Background(), 15*time.Second)
+		var ar *http.Response
+		areq, aerr := http.NewRequestWithContext(actx, http.MethodPost, approveURL, nil)
+		if aerr == nil {
+			ar, aerr = cli.Do(areq)
+		}
+		switch {
+		case aerr != nil:
+			finish("")
+			fmt.Fprintf(os.Stderr,
+				"⚠ couldn't reach the gateway over the tailnet to self-approve\n"+
+					"  (is this machine logged into the tailnet that has %s?)\n"+
+					"  — approve on the dashboard instead.\n", gateway)
+		case ar.StatusCode == 200:
+			_ = ar.Body.Close()
+			autoApproved = true
+			finish("✓ auto-approved as tailnet operator")
+		case ar.StatusCode == 403:
+			// Not an operator — clear the pending line and fall through
+			// to dashboard approval. Normal for any non-allowlisted user.
+			_ = ar.Body.Close()
+			finish("")
+		default:
 			body, _ := io.ReadAll(io.LimitReader(ar.Body, 1024))
 			_ = ar.Body.Close()
-			switch ar.StatusCode {
-			case 200:
-				autoApproved = true
-				fmt.Println()
-				fmt.Println("Auto-approved via tailnet operator identity.")
-			case 403:
-				// Not an operator — quietly fall through to the
-				// browser-approval path. No warning: this is the
-				// normal case for any user not on the allowlist.
-			default:
-				fmt.Fprintf(os.Stderr,
-					"⚠ auto-approve unexpected status %d: %s\n  Falling back to dashboard approval.\n",
-					ar.StatusCode, strings.TrimSpace(string(body)))
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "⚠ auto-approve POST failed: %v; falling back to dashboard approval.\n", aerr)
+			finish("")
+			fmt.Fprintf(os.Stderr,
+				"⚠ auto-approve unexpected status %d: %s — approve on the dashboard instead.\n",
+				ar.StatusCode, strings.TrimSpace(string(body)))
 		}
-	}
-
-	if !autoApproved {
-		fmt.Println()
-		fmt.Println("Verify code in browser:")
-		fmt.Println()
-		fmt.Printf("    %s\n", start.UserCode)
-		fmt.Println()
-		fmt.Println(start.VerifyURL)
-		// One-line CA fingerprint after the verify URL. The
-		// dashboard's approval page shows the same value next to
-		// the user_code — operator visually confirms they match
-		// before clicking approve, blocking an on-path swap of the
-		// CA the CLI just fetched over plain HTTP.
-		if setup != nil && setup.caFingerprint != "" {
-			fmt.Println()
-			fmt.Printf("CA fingerprint: %s\n", setup.caFingerprint)
-		}
-		fmt.Println()
-		// Tailnet-only verify URLs (100.64.0.0/10 IP or *.ts.net
-		// host) are unreachable from the machine running
-		// `clawpatrol join` until approval lands — that's the whole
-		// point of needing approval. Print a QR code so the operator
-		// can scan from a phone or another already-tailnet-connected
-		// device. Skip tryOpen on that path: a local browser can't
-		// reach the URL anyway, and the spawned xdg-open / open
-		// process just produces a meaningless tab.
-		if isTailnetOnlyURL(start.VerifyURL) {
-			printVerifyQR(start.VerifyURL)
-		} else {
-			tryOpen(start.VerifyURL)
-		}
+		acancel()
 	}
 
 	// 2. poll
@@ -1040,13 +1015,42 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 	// In whole-machine mode the clawpatrol WireGuard tunnel already routes
 	// all traffic — including these poll requests. When the admin approves,
 	// MintKey evicts our old peer from the gateway device, killing the
-	// tunnel mid-poll and hanging the spinner indefinitely. Bring it down
-	// before polling so requests go over the regular internet.
+	// tunnel mid-poll and hanging the join indefinitely. Bring it down
+	// before polling so requests go over the regular internet — and before
+	// the approve step below, so wg-quick's own output doesn't land inside
+	// that step's block.
 	if wholeMachine {
 		_ = runAsRoot("wg-quick", "down", "clawpatrol").Run()
 	}
 
-	stopSpin := startSpinner("Waiting for approval")
+	// Manual approval: show the approve step and leave it up until the
+	// poll loop sees the device approved, then collapse it to "✓ approved".
+	// No spinner — the step block is the indicator. (Auto-approve already
+	// printed its own "✓ auto-approved …".)
+	var finishApprove func(string)
+	if !autoApproved {
+		// Tailnet-only verify URLs (100.64.0.0/10 IP or *.ts.net host)
+		// are unreachable from the joining machine until approval lands,
+		// so show a QR to scan from a phone / tailnet device. For a
+		// publicly reachable URL, skip the QR and just open a browser.
+		tailnetOnly := isTailnetOnlyURL(start.VerifyURL)
+		detail := linkDetail(start.VerifyURL, tailnetOnly)
+		if !tailnetOnly {
+			tryOpen(start.VerifyURL)
+		}
+		// CA fingerprint with the why: this machine downloaded the CA
+		// over plain HTTP, so an on-path attacker could have swapped it.
+		// The dashboard shows the fingerprint the gateway actually has;
+		// matching them by eye before approving rules that swap out.
+		if setup != nil && setup.caFingerprint != "" {
+			detail = append(detail,
+				"",
+				"  before approving, confirm this CA fingerprint matches the dashboard:",
+				"  "+setup.caFingerprint)
+		}
+		finishApprove = beginStep("Approve this device on the dashboard — code "+start.UserCode, detail, true)
+	}
+
 	authKey, loginServer, apiToken := "", "", ""
 	var tailnetGWHost, tailnetControlURL, gatewayIP, caPEM string
 	// Track the most recent transport error so a poll loop that never
@@ -1083,18 +1087,18 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 			break
 		}
 		if e := pv["error"]; e != "" && e != "authorization_pending" && e != "slow_down" {
-			stopSpin()
 			return false, fmt.Errorf("poll: %s (%s)", e, pv["detail"])
 		}
 	}
-	stopSpin()
 	if authKey == "" {
 		if lastPollErr != nil {
 			return false, fmt.Errorf("timed out waiting for approval (last poll error: %w)", lastPollErr)
 		}
 		return false, fmt.Errorf("timed out waiting for approval")
 	}
-	fmt.Println("Approved.")
+	if finishApprove != nil {
+		finishApprove("✓ approved")
+	}
 	// Approval click ⇒ operator visually confirmed the CA
 	// fingerprint on the dashboard matched what the CLI
 	// printed. Only now is it safe to push the fetched CA
@@ -1163,14 +1167,9 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		if runtime.GOOS == "darwin" {
 			macErr = macHelperInstall(wholeMachine)
 		}
-		items := []string{}
-		if wgIP := wgAddressFromConf(authKey); wgIP != "" {
-			items = append(items, "Joined as "+wgIP)
-		} else {
-			items = append(items, "Joined")
-		}
-		items = append(items, setupSummaryItems(*setup)...)
-		printTreeItems(items)
+		items := setupSummaryItems(*setup)
+		items = append(items, "✓ joined gateway")
+		printChecklist(items)
 		fmt.Println()
 		if !wholeMachine {
 			fmt.Println("Installed! Try: clawpatrol run claude")
@@ -1213,15 +1212,7 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 				if fp, ferr := caFingerprintFromPEM([]byte(caPEM)); ferr == nil {
 					setup.caFingerprint = fp
 				}
-				if !skipTrust {
-					if ierr := installCATrust(setup.caPath); ierr == nil {
-						setup.caInstalled = true
-					} else {
-						setup.caHint = manualTrustHint(setup.caPath)
-					}
-				} else {
-					setup.caHint = manualTrustHint(setup.caPath)
-				}
+				setup.installTrust(skipTrust)
 			}
 		}
 		if err := os.WriteFile(filepath.Join(clawDir, "mode"), []byte("tailscale\n"), 0o600); err != nil {
@@ -1275,9 +1266,9 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 				return false, fmt.Errorf("write auth-key: %w", err)
 			}
 		}
-		items := []string{"Joined (tsnet mode — persistent daemon node joins tailnet on first `clawpatrol run`)"}
-		items = append(items, setupSummaryItems(*setup)...)
-		printTreeItems(items)
+		items := setupSummaryItems(*setup)
+		items = append(items, "✓ joined gateway")
+		printChecklist(items)
 		fmt.Println()
 		fmt.Println("Installed! Try: clawpatrol run claude")
 		return false, nil
@@ -1397,15 +1388,7 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 					[]byte(peer.TailscaleIPs[0]+"\n"), 0o600)
 				if _, serr := os.Stat(setup.caPath); serr != nil {
 					if ferr := fetchCA(peer.TailscaleIPs[0], setup.caPath); ferr == nil {
-						if !skipTrust {
-							if ierr := installCATrust(setup.caPath); ierr != nil {
-								setup.caHint = manualTrustHint(setup.caPath)
-							} else {
-								setup.caInstalled = true
-							}
-						} else {
-							setup.caHint = manualTrustHint(setup.caPath)
-						}
+						setup.installTrust(skipTrust)
 					}
 				}
 			}
@@ -1417,11 +1400,11 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		}
 	}
 
-	items := []string{"Joined tailnet as " + tailIP}
-	items = append(items, setupSummaryItems(*setup)...)
-	printTreeItems(items)
+	items := setupSummaryItems(*setup)
+	items = append(items, "✓ joined gateway")
+	printChecklist(items)
 	fmt.Println()
-	fmt.Println("Installed! Try: clawpatrol run -- claude")
+	fmt.Println("Installed! Try: clawpatrol run claude")
 
 	return false, nil
 }
@@ -1453,20 +1436,75 @@ func isTailnetOnlyURL(u string) bool {
 // inside it is unreachable except from a tailnet member.
 var tailscaleCGNAT = netip.MustParsePrefix("100.64.0.0/10")
 
-// printVerifyQR writes a terminal QR code encoding url to stdout.
-// Used when the verify URL is tailnet-only — the operator scans with a
-// phone or another already-onboarded device that can actually reach
-// the gateway.
+// approveBaseFromVerifyURL returns the scheme://host origin of the
+// onboard verify URL — the dashboard origin whose /api/onboard/approve
+// is the same handler the dashboard Approve button POSTs to. Falls back
+// to the join URL when verify_url is absent or unparseable.
+func approveBaseFromVerifyURL(verifyURL, fallback string) string {
+	if verifyURL == "" {
+		return fallback
+	}
+	u, err := neturl.Parse(verifyURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fallback
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// qrLines renders url as half-block QR rows, each indented two spaces
+// so it sits under a step's "* " headline. GenerateHalfBlock packs two
+// QR rows per line via ▀/▄/█/space — half the height of the
+// block-per-cell variant, and it renders cleanly when the join output
+// is piped to a file or pasted into chat.
+func qrLines(url string) []string {
+	var buf bytes.Buffer
+	qrterminal.GenerateHalfBlock(url, qrterminal.M, &buf)
+	var out []string
+	for _, line := range strings.Split(strings.TrimRight(buf.String(), "\n"), "\n") {
+		out = append(out, "  "+line)
+	}
+	return out
+}
+
+// linkDetail returns the indented detail lines for a step that points
+// the operator at a URL: the URL itself, and — when qr is true — a
+// blank line plus a scannable QR beneath it. Shared by the
+// tailnet-login and dashboard-approval steps so the URL + QR layout
+// stays identical everywhere it appears.
+func linkDetail(url string, qr bool) []string {
+	out := []string{"  " + url}
+	if qr {
+		out = append(out, "")
+		out = append(out, qrLines(url)...)
+	}
+	return out
+}
+
+// beginStep prints a pending step — a "* "-prefixed headline plus any
+// already-indented detail lines — and returns a finish func. On a TTY
+// (and when erasable) finish erases the whole block and reprints it as
+// a single status line ("✓ …" done, "! …" needs-attention, or "" to
+// just clear it); off a TTY it appends the status line below instead.
 //
-// GenerateHalfBlock packs two QR rows per terminal line via the
-// ▀ / ▄ / █ / space unicode chars. Half the vertical space of the
-// ANSI-colored block-per-cell variant, and renders cleanly when the
-// operator pipes the join output to a file or pastes it into chat.
-func printVerifyQR(url string) {
-	fmt.Println("Tailnet-only URL — scan from a device with tailnet access:")
-	fmt.Println()
-	qrterminal.GenerateHalfBlock(url, qrterminal.M, os.Stdout)
-	fmt.Println()
+// Nothing else may write to stdout between begin and finish or the
+// erase line-count drifts. erasable must be false when the step shells
+// out to something that writes to the terminal (an interactive sudo
+// password prompt), since that output would land inside the block.
+func beginStep(headline string, detail []string, erasable bool) func(status string) {
+	fmt.Println("* " + headline)
+	for _, l := range detail {
+		fmt.Println(l)
+	}
+	n := 1 + len(detail)
+	erase := erasable && isTerminal(os.Stdout)
+	return func(status string) {
+		if erase {
+			fmt.Printf("\033[%dA\033[J", n)
+		}
+		if status != "" {
+			fmt.Println(status)
+		}
+	}
 }
 
 func tryOpen(u string) {

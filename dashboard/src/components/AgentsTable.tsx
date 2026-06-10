@@ -55,11 +55,20 @@ export function AgentsTable({
           const dotTitle = flagged
             ? `${needs.length} integration${needs.length === 1 ? "" : "s"} need setup: ${needs.join(", ")}`
             : "";
+          // Placeholder rows for devices approved but not yet connected
+          // (the gateway keys them "tsnet-<host>" until first register).
+          const pending = a.ip.startsWith("tsnet-");
           return (
             <tr
               key={a.ip}
               onClick={() => onSelect?.(a.ip)}
-              className="border-b border-canvas-muted cursor-pointer hover:bg-canvas-muted transition-colors"
+              className={
+                "border-b border-canvas-muted cursor-pointer hover:bg-canvas-muted transition-colors " +
+                // Dim pending rows as a cue, but keep them clickable —
+                // the detail page is where the operator re-assigns the
+                // profile before the device first connects.
+                (pending ? "opacity-70" : "")
+              }
             >
               <Td>
                 <div className="flex items-center gap-1.5 min-w-0">
@@ -94,10 +103,11 @@ export function AgentsTable({
               <Td
                 className="text-xs text-text-muted tabular-nums truncate"
                 title={
-                  [a.external_ipv4, a.external_ipv6].filter(Boolean).join(" / ") || `wg ${a.ip}`
+                  [a.external_ipv4, a.external_ipv6].filter(Boolean).join(" / ") ||
+                  (pending ? "approved, waiting for first connect" : `wg ${a.ip}`)
                 }
               >
-                {a.external_ipv4 || a.external_ipv6 || a.ip}
+                {a.external_ipv4 || a.external_ipv6 || (pending ? "pending first connect" : a.ip)}
               </Td>
             </tr>
           );
