@@ -1046,7 +1046,7 @@ func codexRequestModel(body []byte) string {
 // trackLLMUsage parses LLM API request/response bodies for session id,
 // title, model, and token usage. Only fires on actual model-invocation
 // endpoints; ignores heartbeat / event_logging / mcp / oauth probes.
-func (g *Gateway) trackLLMUsage(c net.Conn, kind, path string, reqBody, respBody []byte, sessionHint string) {
+func (g *Gateway) trackLLMUsage(c net.Conn, kind, host, path string, reqBody, respBody []byte, sessionHint string, reqStart time.Time) {
 	ip := g.agentIPFor(c)
 	switch kind {
 	case "claude_usage":
@@ -1060,14 +1060,15 @@ func (g *Gateway) trackLLMUsage(c net.Conn, kind, path string, reqBody, respBody
 			model = respModel
 		}
 		// Prefer Claude Code's session id from metadata; fall back to
-		// hash of first real user message. Skip if neither.
+		// hash of first real user message. Skip usage if neither.
 		sid := reqInfo.SessionID
 		title := reqInfo.Title
-		if sid == "" {
-			if title == "" {
-				return // heartbeat/probe with no session info
-			}
+		if sid == "" && title != "" {
 			sid = shortHash(title)
+		}
+		g.recordGenAITurn("anthropic", sid, host, reqInfo.Model, respModel, in, out, reqBody, respBody, reqStart)
+		if sid == "" {
+			return // heartbeat/probe with no session info
 		}
 		g.agents.recordLLMUsage(ip, "claude", sid, title, model, in, out)
 	case "openai_usage":
@@ -1082,6 +1083,7 @@ func (g *Gateway) trackLLMUsage(c net.Conn, kind, path string, reqBody, respBody
 		if model == "" && in == 0 && out == 0 && title == "" {
 			return
 		}
+		g.recordGenAITurn("openai", sid, host, model, model, in, out, reqBody, respBody, reqStart)
 		g.agents.recordLLMUsage(ip, "codex", sid, title, model, in, out)
 	case "codex_ws_usage":
 		// chatgpt.com Codex backend. Two transports:
@@ -1102,6 +1104,7 @@ func (g *Gateway) trackLLMUsage(c net.Conn, kind, path string, reqBody, respBody
 		if sid == "" {
 			sid = shortHash(codexResponsesRequestFirstTitle(reqBody))
 		}
+		g.recordGenAITurn("openai", sid, host, model, model, in, out, reqBody, respBody, reqStart)
 		g.agents.recordLLMUsage(ip, "codex", sid, title, model, in, out)
 	}
 }
@@ -2645,7 +2648,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					_ = zr.Close()
 				}
 			}
-			g.trackLLMUsage(c, trackKind, req.URL.Path, trackedReqBody, body, sessionHint)
+			g.trackLLMUsage(c, trackKind, host, req.URL.Path, trackedReqBody, body, sessionHint, rtStart)
 		}
 
 		if hitlRetryConsumedOperation != nil {
